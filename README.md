@@ -27,6 +27,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 > Примечание: эмбеддинг-часть работает только на CPU (параметр `EMBEDDING_DEVICE` ограничен значением `cpu`). Для Ollama используйте CPU-конфигурацию на стороне сервиса.
 
+Для гарантированного CPU-only стека зависимости PyTorch устанавливаются из CPU-репозитория (см. `requirements.txt`).
+
 ## API
 
 ### POST /process_ticket
