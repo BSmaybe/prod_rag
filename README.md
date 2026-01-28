@@ -16,6 +16,8 @@
 ```bash
 export OLLAMA_URL="http://localhost:11434/api/generate"
 export OLLAMA_MODEL="qwen2.5:7b-instruct-q4_k_m"
+export EMBEDDING_MODEL="intfloat/multilingual-e5-small"
+export EMBEDDING_DEVICE="cpu"
 export QDRANT_URL="http://localhost:6333"
 export SERVICE_API_KEY="<optional>"
 
@@ -23,12 +25,18 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+> Примечание: эмбеддинг-часть работает только на CPU (параметр `EMBEDDING_DEVICE` ограничен значением `cpu`). Для Ollama используйте CPU-конфигурацию на стороне сервиса.
+
+Для гарантированного CPU-only стека зависимости PyTorch устанавливаются из CPU-репозитория (см. `requirements.txt`).
+
 ## API
 
 ### POST /process_ticket
 
 Заголовок (опционально, если задан `SERVICE_API_KEY`):
 - `X-API-Key: <ключ>`
+
+n8n должен вызывать этот endpoint после получения тикета из Service Desk, передавая текст инцидента и `ticket_id`.
 
 Пример запроса:
 
