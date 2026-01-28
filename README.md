@@ -29,6 +29,24 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 Для гарантированного CPU-only стека зависимости PyTorch устанавливаются из CPU-репозитория (см. `requirements.txt`).
 
+## Docker Compose
+
+Запуск сервисов:
+
+```bash
+docker compose up -d
+```
+
+Пример переменных окружения для `app`:
+
+```bash
+export OLLAMA_URL="http://ollama:11434/api/generate"
+export QDRANT_URL="http://qdrant:6333"
+export EMBEDDING_MODEL="intfloat/multilingual-e5-small"
+export EMBEDDING_DEVICE="cpu"
+export SERVICE_API_KEY=""
+```
+
 ## API
 
 ### POST /process_ticket
