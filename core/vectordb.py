@@ -4,8 +4,15 @@ from .config import QDRANT_URL, COLLECTION_NAME, EMBEDDING_MODEL
 
 # Инициализация (Singleton)
 client = QdrantClient(url=QDRANT_URL)
-# Модель грузим в память один раз (она легкая, ~300Мб)
-embedder = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+_embedder = None
+
+
+def _get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is None:
+        # Модель грузим в память один раз (она легкая, ~300Мб)
+        _embedder = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+    return _embedder
 
 def search_tickets(query: str, top_k: int = 5):
     """
@@ -13,7 +20,10 @@ def search_tickets(query: str, top_k: int = 5):
     """
     # 1. Генерируем вектор запроса
     # Добавляем префикс "query: ", так как модель e5-small этого требует
-    query_vec = embedder.encode(f"query: {query}", normalize_embeddings=True).tolist()
+    query_vec = _get_embedder().encode(
+        f"query: {query}",
+        normalize_embeddings=True
+    ).tolist()
 
     # 2. Поиск
     results = client.search(
