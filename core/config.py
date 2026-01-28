@@ -9,7 +9,8 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION_NAME = "bank_tickets"
 
 # Настройки эмбеддингов (локально на CPU)
-EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
+EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
 
 # Опциональный API ключ для вызова /process_ticket
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY")

@@ -1,6 +1,6 @@
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-from .config import QDRANT_URL, COLLECTION_NAME, EMBEDDING_MODEL
+from .config import QDRANT_URL, COLLECTION_NAME, EMBEDDING_MODEL, EMBEDDING_DEVICE
 
 # Инициализация (Singleton)
 client = QdrantClient(url=QDRANT_URL)
@@ -11,7 +11,10 @@ def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
         # Модель грузим в память один раз (она легкая, ~300Мб)
-        _embedder = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+        device = EMBEDDING_DEVICE.lower()
+        if device != "cpu":
+            device = "cpu"
+        _embedder = SentenceTransformer(EMBEDDING_MODEL, device=device)
     return _embedder
 
 def search_tickets(query: str, top_k: int = 5):
