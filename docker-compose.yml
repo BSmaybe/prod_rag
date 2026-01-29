@@ -2,32 +2,47 @@ version: "3.8"
 
 services:
   app:
-    build: .
+    image: bank-rag-app:latest
+    pull_policy: never
+    restart: always
     ports:
       - "8000:8000"
     environment:
-      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434/api/generate}
-      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-intfloat/multilingual-e5-small}
-      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
-      SERVICE_API_KEY: ${SERVICE_API_KEY:-}
+      # Все переменные теперь через тире (единый стиль)
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434/api/generate}
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - EMBEDDING_MODEL=/app/model_data
+      - SENTENCE_TRANSFORMERS_HOME=/app/model_data
+      - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+      - LLM_MODEL=bank-bot
+      - OLLAMA_BASE_URL=http://ollama:11434
+    env_file: .env
     depends_on:
-      - qdrant
       - ollama
-
+      - qdrant
+    volumes:
+      - ./1_Pooling:/app/model_data/1_Pooling
   qdrant:
     image: qdrant/qdrant:latest
+    restart: always
     ports:
       - "6333:6333"
+    environment:
+      - QDRANT__SERVICE__HARDWARE_REPORTING=false
     volumes:
       - qdrant_data:/qdrant/storage
 
   ollama:
     image: ollama/ollama:latest
+    container_name: prod_rag-ollama-1
+    restart: always
     ports:
       - "11434:11434"
     volumes:
-      - ollama_data:/root/.ollama
+      - ./ollama_data:/root/.ollama
+      - ./model.gguf:/root/model.gguf
+      - ./Modelfile:/root/Modelfile
 
 volumes:
   qdrant_data:

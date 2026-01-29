@@ -26,7 +26,7 @@ tokenizers>=0.19.1
 
 # --- Vector Database ---
 # Qdrant Client 1.16.2+ добавляет встроенный гибридный поиск (BM25) [10, 11]
-qdrant-client>=1.16.2
+qdrant-client>=1.7.0
 # gRPC для быстрого общения с базой данных [12]
 grpcio>=1.66.2
 
@@ -36,6 +36,7 @@ optimum>=1.20.0
 onnxruntime>=1.18.0
 
 # --- Utilities & Clients ---
+requests>=2.32.0
 httpx>=0.27.2
 python-dotenv>=1.0.0  # Для загрузки .env переменных [15]
 numpy<2.0.0           # Фиксация до 2.0 важна для совместимости многих ML-библиотек [16]

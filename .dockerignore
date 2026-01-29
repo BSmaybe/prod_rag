@@ -1,0 +1,15 @@
+*.tar
+*.tar.gz
+
+.env
+.venv
+venv
+
+deploy.ps1
+
+
+.git
+.idea
+__pycache__
+Modelfile
+model.gguf
