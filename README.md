@@ -37,6 +37,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 docker compose up -d
 ```
 
+После запуска n8n будет доступен на `http://localhost:5678` (значения можно менять через `N8N_HOST` и `N8N_PORT`).
+
 Пример переменных окружения для `app`:
 
 ```bash
@@ -46,6 +48,32 @@ export EMBEDDING_MODEL="intfloat/multilingual-e5-small"
 export EMBEDDING_DEVICE="cpu"
 export SERVICE_API_KEY=""
 ```
+
+Пример переменных окружения для `n8n`:
+
+```bash
+export N8N_HOST="localhost"
+export N8N_PORT="5678"
+export N8N_BASIC_AUTH_USER="admin"
+export N8N_BASIC_AUTH_PASSWORD="change-me"
+export WEBHOOK_URL="http://localhost:5678"
+export NAUMEN_API_URL="https://naumen.example/api/tickets"
+export TELEGRAM_CHAT_ID="123456789"
+```
+
+> В Docker Compose n8n обращается к сервису `app` по адресу `http://app:8000/process_ticket`. Если n8n запускается вне Docker-сети, поменяйте URL в workflow на `http://host.docker.internal:8000/process_ticket`.
+
+### Импорт workflow в n8n
+
+1. Откройте n8n: `http://localhost:5678`.
+2. В меню **Workflows → Import from File** выберите файл `docs/n8n-workflows/naumen-ticket-processing.json`.
+3. В основном workflow обновите:
+   - URL HTTP Request на `/process_ticket` (если нужно переопределить `app` ↔ `host.docker.internal`);
+   - `X-API-Key`, если используется `SERVICE_API_KEY`.
+4. Создайте креденшлы:
+   - **HTTP Header Auth** для Naumen (используется узлом **Send comment to Naumen**).
+   - **Telegram** для error workflow.
+5. Включите error workflow (**Naumen Ticket Error Handler**) и назначьте его как обработчик ошибок для основного workflow в настройках.
 
 ## API
 

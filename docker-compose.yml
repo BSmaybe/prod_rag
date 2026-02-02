@@ -34,6 +34,8 @@ services:
     depends_on:
       - qdrant
       - ollama
+    networks:
+      - app_net
 
     volumes:
       # Монтируем ПОЛНУЮ модель (config.json, safetensors, tokenizer и т.д.)
@@ -55,6 +57,8 @@ services:
       - no_proxy=localhost,127.0.0.1,::1
     volumes:
       - qdrant_data:/qdrant/storage
+    networks:
+      - app_net
 
   ollama:
     image: ollama/ollama:latest
@@ -67,8 +71,27 @@ services:
       - ollama_data:/root/.ollama
       - ./model.gguf:/root/model.gguf
       - ./Modelfile:/root/Modelfile
+    networks:
+      - app_net
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PORT=${N8N_PORT:-5678}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD:-change-me}
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://localhost:5678}
+    networks:
+      - app_net
 
 volumes:
   qdrant_data:
   ollama_data:
   st_cache:
+
+networks:
+  app_net:
