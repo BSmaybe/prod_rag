@@ -1,7 +1,6 @@
 # --- System / Hardware Optimization ---
 # Важно: эта строка гарантирует установку PyTorch ТОЛЬКО для CPU (экономит ~800МБ)
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
+--index-url https://pypi.org/simple
 
 # --- Core API Framework ---
 # FastAPI 0.128.0+ исправляет баги с алиасами и улучшает трейсбеки [1, 2]

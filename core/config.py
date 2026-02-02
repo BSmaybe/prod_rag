@@ -14,3 +14,7 @@ EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
 
 # Опциональный API ключ для вызова /process_ticket
 SERVICE_API_KEY = os.getenv("SERVICE_API_KEY")
+
+# Настройки Qdrant (вектор и метрика)
+QDRANT_VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "384"))
+QDRANT_DISTANCE = os.getenv("QDRANT_DISTANCE", "Cosine")

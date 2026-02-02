@@ -1,0 +1,23 @@
+# IDE
+.idea/
+*.iml
+ 
+# local stuff / data
+1_Pooling/
+local_model/
+ollama_data/
+model_data/
+ 
+# secrets
+.env
+.env.*
+ 
+# archives
+*.tar
+*.tar.gz
+*.zip
+*.gz
+ 
+# python cache
+__pycache__/
+*.pyc

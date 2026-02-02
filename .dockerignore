@@ -7,9 +7,26 @@ venv
 
 deploy.ps1
 
-
-.git
 .idea
 __pycache__
 Modelfile
 model.gguf
+
+# huge local data
+ollama_data/
+qdrant_data/
+*.gguf
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# git
+.git/

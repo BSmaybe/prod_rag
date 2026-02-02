@@ -1,6 +1,14 @@
 # 1. Базовый образ Python (легкий)
 FROM python:3.11-slim
 
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+
+ENV http_proxy=$http_proxy \
+    https_proxy=$https_proxy \
+    no_proxy=$no_proxy
+
 # 2. Рабочая папка внутри контейнера
 WORKDIR /app
 

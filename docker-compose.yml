@@ -1,49 +1,74 @@
-version: "3.8"
-
 services:
   app:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: bank-rag-app:latest
     pull_policy: never
     restart: always
     ports:
       - "8000:8000"
+    env_file: .env
     environment:
-      # Все переменные теперь через тире (единый стиль)
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434/api/generate}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - COLLECTION_NAME=${COLLECTION_NAME:-bank_tickets}
+
+      # ВАЖНО: модель у тебя в ./local_model
       - EMBEDDING_MODEL=/app/model_data
-      - SENTENCE_TRANSFORMERS_HOME=/app/model_data
+      - SENTENCE_TRANSFORMERS_HOME=/app/st_cache
       - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+
       - SERVICE_API_KEY=${SERVICE_API_KEY:-}
       - LLM_MODEL=bank-bot
       - OLLAMA_BASE_URL=http://ollama:11434
-    env_file: .env
+
+      # чтобы локальные запросы не уходили в корпоративный proxy
+      - NO_PROXY=localhost,127.0.0.1,::1,qdrant,ollama
+      - no_proxy=localhost,127.0.0.1,::1,qdrant,ollama
+
+      # если используешь QDRANT_VECTOR_SIZE в config.py - лучше явно:
+      - QDRANT_VECTOR_SIZE=384
+      - QDRANT_DISTANCE=Cosine
+
     depends_on:
-      - ollama
       - qdrant
+      - ollama
+
     volumes:
-      - ./1_Pooling:/app/model_data/1_Pooling
+      # Монтируем ПОЛНУЮ модель (config.json, safetensors, tokenizer и т.д.)
+      - ./local_model:/app/model_data:ro
+      # Кеш sentence-transformers отдельно, чтобы не пытался писать в :ro
+      - st_cache:/app/st_cache
+
   qdrant:
     image: qdrant/qdrant:latest
+    pull_policy: never
     restart: always
     ports:
       - "6333:6333"
+      - "6334:6334"
     environment:
       - QDRANT__SERVICE__HARDWARE_REPORTING=false
+      - QDRANT__TELEMETRY_DISABLED=true
+      - NO_PROXY=localhost,127.0.0.1,::1
+      - no_proxy=localhost,127.0.0.1,::1
     volumes:
       - qdrant_data:/qdrant/storage
 
   ollama:
     image: ollama/ollama:latest
+    pull_policy: never
     container_name: prod_rag-ollama-1
     restart: always
     ports:
       - "11434:11434"
     volumes:
-      - ./ollama_data:/root/.ollama
+      - ollama_data:/root/.ollama
       - ./model.gguf:/root/model.gguf
       - ./Modelfile:/root/Modelfile
 
 volumes:
   qdrant_data:
   ollama_data:
+  st_cache:
