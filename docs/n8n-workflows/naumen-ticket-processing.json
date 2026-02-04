@@ -1,0 +1,176 @@
+[
+  {
+    "id": "1",
+    "name": "Naumen Ticket Processing",
+    "active": false,
+    "nodes": [
+      {
+        "id": "webhook-ticket",
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 1,
+        "position": [
+          0,
+          0
+        ],
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "ticket-webhook",
+          "responseMode": "onReceived",
+          "responseData": "allEntries"
+        }
+      },
+      {
+        "id": "if-closed",
+        "name": "IF Closed",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          240,
+          0
+        ],
+        "parameters": {
+          "conditions": {
+            "string": [
+              {
+                "value1": "={{$json[\"status\"]}}",
+                "operation": "equal",
+                "value2": "Закрыт"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "noop-closed",
+        "name": "Stop for closed",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          480,
+          -120
+        ]
+      },
+      {
+        "id": "call-app",
+        "name": "Call /process_ticket",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [
+          480,
+          120
+        ],
+        "parameters": {
+          "authentication": "none",
+          "method": "POST",
+          "url": "http://api:8080/process_ticket",
+          "sendBody": true,
+          "jsonParameters": true,
+          "options": {
+            "timeout": 120000
+          },
+          "headerParametersJson": "={\n  \"X-API-Key\": \"{{$env.SERVICE_API_KEY || ''}}\"\n}",
+          "bodyParametersJson": "={{$json}}"
+        }
+      },
+      {
+        "id": "format-html",
+        "name": "Format HTML",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 2,
+        "position": [
+          720,
+          120
+        ],
+        "parameters": {
+          "functionCode": "const data = items[0].json;\nconst rag = data.rag_response || {};\nconst renderList = (title, itemsList = []) => {\n  if (!itemsList || itemsList.length === 0) return '';\n  const listItems = itemsList.map((item) => `<li>${item}</li>`).join('');\n  return `<p><strong>${title}</strong></p><ul>${listItems}</ul>`;\n};\n\nconst html = [\n  `<p><strong>Ticket:</strong> ${data.ticket_id || ''}</p>`,\n  renderList('Описание', rag.description),\n  renderList('Причины', rag.causes),\n  renderList('Действия', rag.actions),\n  renderList('Дальнейшие шаги', rag.next_steps)\n].filter(Boolean).join('');\n\nreturn [{ json: { html, ticket_id: data.ticket_id } }];"
+        }
+      },
+      {
+        "id": "send-naumen",
+        "name": "Send comment to Naumen",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [
+          960,
+          120
+        ],
+        "parameters": {
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "httpHeaderAuth",
+          "method": "POST",
+          "url": "={{$env.NAUMEN_API_URL || 'https://naumen.example/api/tickets/' + $json.ticket_id + '/comments'}}",
+          "sendBody": true,
+          "jsonParameters": true,
+          "bodyParametersJson": "={\n  \"html\": $json.html\n}",
+          "options": {
+            "timeout": 120000
+          }
+        },
+        "credentials": {
+          "httpHeaderAuth": {
+            "id": "1",
+            "name": "Naumen API"
+          }
+        }
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "IF Closed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Closed": {
+        "main": [
+          [
+            {
+              "node": "Stop for closed",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Call /process_ticket",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Call /process_ticket": {
+        "main": [
+          [
+            {
+              "node": "Format HTML",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Format HTML": {
+        "main": [
+          [
+            {
+              "node": "Send comment to Naumen",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "saveExecutionProgress": true,
+      "saveManualExecutions": true
+    }
+  }
+]

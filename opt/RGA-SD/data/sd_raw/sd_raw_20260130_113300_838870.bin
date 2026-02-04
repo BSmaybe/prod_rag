@@ -1,0 +1,13 @@
+{
+  "UUID": "data$7777175",
+  "title": "117_16-32-30-01-2026",
+  "type": "waitingLines",
+  "creationDate": {
+    "delegate": "Jan 30, 2026, 4:32:53 PM",
+    "isDateTime": true
+  },
+  "message": {
+    "lang": "",
+    "text": "{\"header\":{\"serviceCall\":{\"UUID\":\"serviceCall$1636643228\",\"title\":\"RP4948811\",\"state\":\"waitLine\",\"idHolder\":\"\"},\"condition\":\"waitingLines\"},\"serviceCall\":{\"UUID\":\"serviceCall$1636643228\",\"responsibleTeam\":{\"UUID\":\"team$227161316\",\"title\":\"Remote Channels\",\"idHolder\":\"null\",\"code\":\"null\",\"metaClass\":\"team$autoRouteTeams\"},\"responsibleEmployee\":null,\"state\":\"waitLine\"}}"
+  }
+}

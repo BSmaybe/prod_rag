@@ -1,0 +1,29 @@
+# env
+.env
+
+# models
+models/
+*.gguf
+local_model/
+st_cache/
+
+# local data
+data/db/
+data/db_old_1/
+data/new_tickets/
+data/raw/_bad/
+data/sd_raw/
+data/sd_events/
+data/sd_state/
+ollama_data/
+qdrant_data/
+n8n_data/
+
+# python
+__pycache__/
+*.pyc
+
+# ide/os
+.vscode/
+.idea/
+.DS_Store
