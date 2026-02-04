@@ -1,6 +1,6 @@
 # env
 .env
-
+opt
 # models
 models/
 *.gguf
