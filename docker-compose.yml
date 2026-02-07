@@ -3,6 +3,13 @@ services:
     build:
       context: .
       dockerfile: ./api/Dockerfile
+      args:
+        - http_proxy=${http_proxy:-}
+        - https_proxy=${https_proxy:-}
+        - no_proxy=${no_proxy:-}
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     container_name: rag-api
     ports:
       - "${API_PORT:-8080}:8080"
@@ -35,9 +42,16 @@ services:
       - DB_URL=${DB_URL:-postgresql://rag:rag@postgres:5432/rag}
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/ticket-webhook}
       - NAUMEN_API_URL=${NAUMEN_API_URL:-https://naumen.example/api/tickets}
+      - http_proxy=${http_proxy:-}
+      - https_proxy=${https_proxy:-}
+      - no_proxy=${no_proxy:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
     depends_on:
       - qdrant
       - ollama
+      - n8n
       - postgres
     restart: unless-stopped
     volumes:
@@ -48,7 +62,11 @@ services:
     networks:
       - app_net
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/readyz || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz').read(); print('ok')\" || exit 1"
+        ]
       interval: 15s
       timeout: 5s
       retries: 10
