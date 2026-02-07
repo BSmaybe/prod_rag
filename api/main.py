@@ -1,19 +1,29 @@
 # api/main.py
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
+import httpx
 from fastapi import FastAPI, Form, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from api.db import db_conn, ensure_schema, set_ticket_status
+from api.db import (
+    claim_outbox_batch,
+    db_conn,
+    ensure_schema,
+    mark_outbox_dead,
+    mark_outbox_retry,
+    mark_outbox_sent,
+    set_ticket_status,
+)
 from core.llm import generate_answer
 from core.vectordb import search_hits
 from etl.anonymize import anonymize_text
@@ -54,6 +64,123 @@ app.add_middleware(
 
 NO_CONTEXT_SCORE_THRESHOLD = float(os.getenv("NO_CONTEXT_SCORE_THRESHOLD", "0.35"))
 NO_CONTEXT_MIN_HITS = int(os.getenv("NO_CONTEXT_MIN_HITS", "2"))
+OUTBOX_POLL_SEC = float(os.getenv("OUTBOX_POLL_SEC", "2"))
+OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
+OUTBOX_MAX_ATTEMPTS = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "8"))
+OUTBOX_BACKOFF_BASE_SEC = int(os.getenv("OUTBOX_BACKOFF_BASE_SEC", "5"))
+N8N_WEBHOOK_URL = (os.getenv("N8N_WEBHOOK_URL") or "").strip()
+
+outbox_worker_task: asyncio.Task[None] | None = None
+
+
+def _next_retry_at(attempts: int) -> datetime:
+    delay_sec = OUTBOX_BACKOFF_BASE_SEC * (2 ** max(attempts, 0))
+    return datetime.now(timezone.utc) + timedelta(seconds=delay_sec)
+
+
+async def _send_outbox_payload(payload: dict[str, Any]) -> None:
+    if not N8N_WEBHOOK_URL:
+        raise RuntimeError("N8N_WEBHOOK_URL is empty")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+        resp = await client.post(N8N_WEBHOOK_URL, json=payload)
+        resp.raise_for_status()
+
+
+def _claim_batch_sync(limit: int) -> list[dict[str, Any]]:
+    with db_conn() as conn:
+        return claim_outbox_batch(conn, limit=limit)
+
+
+def _mark_sent_sync(outbox_id: int) -> None:
+    with db_conn() as conn:
+        mark_outbox_sent(conn, outbox_id=outbox_id)
+
+
+def _mark_retry_sync(
+    outbox_id: int,
+    attempts: int,
+    last_error: str,
+    next_retry_at: datetime,
+) -> None:
+    with db_conn() as conn:
+        mark_outbox_retry(
+            conn,
+            outbox_id=outbox_id,
+            attempts=attempts,
+            last_error=last_error,
+            next_retry_at=next_retry_at,
+        )
+
+
+def _mark_dead_sync(outbox_id: int, last_error: str) -> None:
+    with db_conn() as conn:
+        mark_outbox_dead(conn, outbox_id=outbox_id, last_error=last_error)
+
+
+async def _outbox_worker_loop() -> None:
+    log.info(
+        "outbox_worker_started poll_sec=%s batch_size=%s max_attempts=%s",
+        OUTBOX_POLL_SEC,
+        OUTBOX_BATCH_SIZE,
+        OUTBOX_MAX_ATTEMPTS,
+    )
+    while True:
+        try:
+            batch = await asyncio.to_thread(_claim_batch_sync, OUTBOX_BATCH_SIZE)
+            if not batch:
+                await asyncio.sleep(OUTBOX_POLL_SEC)
+                continue
+
+            for item in batch:
+                outbox_id = int(item.get("id") or 0)
+                ticket_id = str(item.get("ticket_id") or "")
+                payload = item.get("payload") or {}
+                attempts = int(item.get("attempts") or 0)
+                try:
+                    if not isinstance(payload, dict):
+                        raise RuntimeError("outbox payload must be JSON object")
+                    await _send_outbox_payload(payload)
+                    await asyncio.to_thread(_mark_sent_sync, outbox_id)
+                    log.info(
+                        "outbox_sent outbox_id=%s ticket_id=%s attempts=%s",
+                        outbox_id,
+                        ticket_id,
+                        attempts,
+                    )
+                except Exception as e:
+                    next_attempts = attempts + 1
+                    if next_attempts >= OUTBOX_MAX_ATTEMPTS:
+                        await asyncio.to_thread(_mark_dead_sync, outbox_id, str(e))
+                        log.error(
+                            "outbox_dead outbox_id=%s ticket_id=%s attempts=%s error=%s",
+                            outbox_id,
+                            ticket_id,
+                            next_attempts,
+                            e,
+                        )
+                    else:
+                        next_retry = _next_retry_at(attempts)
+                        await asyncio.to_thread(
+                            _mark_retry_sync,
+                            outbox_id,
+                            next_attempts,
+                            str(e),
+                            next_retry,
+                        )
+                        log.warning(
+                            "outbox_retry outbox_id=%s ticket_id=%s attempts=%s next_retry_at=%s error=%s",
+                            outbox_id,
+                            ticket_id,
+                            next_attempts,
+                            next_retry.isoformat(),
+                            e,
+                        )
+        except asyncio.CancelledError:
+            log.info("outbox_worker_stopped")
+            raise
+        except Exception as e:
+            log.exception("outbox_worker_error error=%s", e)
+            await asyncio.sleep(OUTBOX_POLL_SEC)
 
 
 def _clarification_template() -> str:
@@ -76,6 +203,25 @@ def startup_init() -> None:
         log.info("tickets_inbox schema is ready")
     except Exception as e:
         log.error("failed_to_prepare_tickets_inbox error=%s", e)
+
+
+@app.on_event("startup")
+async def startup_outbox_worker() -> None:
+    global outbox_worker_task
+    if outbox_worker_task is None or outbox_worker_task.done():
+        outbox_worker_task = asyncio.create_task(_outbox_worker_loop(), name="n8n-outbox-worker")
+
+
+@app.on_event("shutdown")
+async def shutdown_outbox_worker() -> None:
+    global outbox_worker_task
+    if outbox_worker_task is not None and not outbox_worker_task.done():
+        outbox_worker_task.cancel()
+        try:
+            await outbox_worker_task
+        except asyncio.CancelledError:
+            pass
+    outbox_worker_task = None
 
 
 @app.middleware("http")

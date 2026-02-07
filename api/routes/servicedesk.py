@@ -14,7 +14,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from api.db import db_conn, ensure_schema, upsert_ticket_event
+from api.db import db_conn, ensure_schema, enqueue_outbox_event, upsert_ticket_event
 from api.schemas.servicedesk import TicketsBatchIn
 from core.vectordb import upsert_tickets
 from etl.anonymize import anonymize_text
@@ -31,7 +31,6 @@ class TicketsBatchOut(BaseModel):
 
 
 KB_COLLECTION = os.getenv("COLLECTION_NAME", "kb_tickets")
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "").strip()
 
 
 # =========================
@@ -540,23 +539,6 @@ def _build_n8n_payload(
     return payload
 
 
-async def _dispatch_n8n(payload: Dict[str, Any], request_id: str) -> None:
-    if not N8N_WEBHOOK_URL:
-        log.info("n8n_dispatch_skipped request_id=%s reason=missing_n8n_webhook_url", request_id)
-        return
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
-            await client.post(N8N_WEBHOOK_URL, json=payload)
-        log.info("n8n_dispatched request_id=%s ticket_id=%s", request_id, payload.get("ticket_id"))
-    except Exception as e:
-        log.warning(
-            "n8n_dispatch_failed request_id=%s ticket_id=%s error=%s",
-            request_id,
-            payload.get("ticket_id"),
-            e,
-        )
-
-
 def _fetch_solution_from_naumen(ticket_id: str) -> str:
     base_url = (os.getenv("NAUMEN_API_URL") or "").strip()
     if not base_url:
@@ -656,7 +638,8 @@ async def ingest_from_sd(request: Request):
     max_text_len = _get_env_int("SD_MAX_TEXT_LEN", 10000)
     events_file = events_dir / "sd_events.csv"
 
-    tasks: List[asyncio.Task[Any]] = []
+    kb_tasks: List[asyncio.Task[Any]] = []
+    outbox_enqueued = 0
     accepted = 0
 
     try:
@@ -702,20 +685,27 @@ async def ingest_from_sd(request: Request):
                         text_anonymized=clean_text,
                         raw_payload={"tickets_item": t.model_dump(), "parsed": body},
                         trace_id=request_id,
+                        autocommit=False,
                     )
-                    tasks.append(
-                        asyncio.create_task(
-                            _dispatch_n8n(
-                                _build_n8n_payload(
-                                    ticket_id=ticket_id,
-                                    text_anonymized=clean_text,
-                                    trace_id=request_id,
-                                    state="new",
-                                    flat=flat,
-                                ),
-                                request_id,
-                            )
-                        )
+                    outbox_id = enqueue_outbox_event(
+                        conn,
+                        ticket_id=ticket_id,
+                        payload=_build_n8n_payload(
+                            ticket_id=ticket_id,
+                            text_anonymized=clean_text,
+                            trace_id=request_id,
+                            state="new",
+                            flat=flat,
+                        ),
+                        autocommit=False,
+                    )
+                    conn.commit()
+                    outbox_enqueued += 1
+                    log.info(
+                        "outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s",
+                        request_id,
+                        ticket_id,
+                        outbox_id,
                     )
                     accepted += 1
             else:
@@ -775,26 +765,33 @@ async def ingest_from_sd(request: Request):
                     text_anonymized=clean_text,
                     raw_payload=body,
                     trace_id=request_id,
+                    autocommit=False,
                 )
 
                 if clean_text:
-                    tasks.append(
-                        asyncio.create_task(
-                            _dispatch_n8n(
-                                _build_n8n_payload(
-                                    ticket_id=ticket_id,
-                                    text_anonymized=clean_text,
-                                    trace_id=request_id,
-                                    state=flat.get("state", ""),
-                                    flat=flat,
-                                ),
-                                request_id,
-                            )
-                        )
+                    outbox_id = enqueue_outbox_event(
+                        conn,
+                        ticket_id=ticket_id,
+                        payload=_build_n8n_payload(
+                            ticket_id=ticket_id,
+                            text_anonymized=clean_text,
+                            trace_id=request_id,
+                            state=flat.get("state", ""),
+                            flat=flat,
+                        ),
+                        autocommit=False,
                     )
+                    outbox_enqueued += 1
+                    log.info(
+                        "outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s",
+                        request_id,
+                        ticket_id,
+                        outbox_id,
+                    )
+                conn.commit()
 
                 if _is_closed_state(flat.get("state", "")):
-                    tasks.append(
+                    kb_tasks.append(
                         asyncio.create_task(
                             _index_closed_ticket_if_quality(
                                 ticket_id=ticket_id,
@@ -812,16 +809,21 @@ async def ingest_from_sd(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to persist SD ticket: {e}")
 
     log.info(
-        "sd_ingest request_id=%s accepted=%s async_tasks=%s raw_file=%s",
+        "sd_ingest request_id=%s accepted=%s outbox_enqueued=%s kb_tasks=%s raw_file=%s",
         request_id,
         accepted,
-        len(tasks),
+        outbox_enqueued,
+        len(kb_tasks),
         raw_path,
     )
 
     return TicketsBatchOut(
         accepted=accepted,
         stored_file=str(raw_path),
-        reindex_started=bool(tasks),
-        reindex_result={"queued_tasks": len(tasks), "collection": KB_COLLECTION},
+        reindex_started=bool(outbox_enqueued or kb_tasks),
+        reindex_result={
+            "outbox_enqueued": outbox_enqueued,
+            "kb_tasks": len(kb_tasks),
+            "collection": KB_COLLECTION,
+        },
     )
