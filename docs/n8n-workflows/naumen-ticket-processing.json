@@ -31,11 +31,10 @@
         ],
         "parameters": {
           "conditions": {
-            "string": [
+            "boolean": [
               {
-                "value1": "={{$json[\"status\"]}}",
-                "operation": "equal",
-                "value2": "Закрыт"
+                "value1": "={{$json[\"is_closed\"]}}",
+                "operation": "isTrue"
               }
             ]
           }
@@ -70,20 +69,7 @@
             "timeout": 120000
           },
           "headerParametersJson": "={\n  \"X-API-Key\": \"{{$env.SERVICE_API_KEY || ''}}\"\n}",
-          "bodyParametersJson": "={{$json}}"
-        }
-      },
-      {
-        "id": "format-html",
-        "name": "Format HTML",
-        "type": "n8n-nodes-base.function",
-        "typeVersion": 2,
-        "position": [
-          720,
-          120
-        ],
-        "parameters": {
-          "functionCode": "const data = items[0].json;\nconst rag = data.rag_response || {};\nconst renderList = (title, itemsList = []) => {\n  if (!itemsList || itemsList.length === 0) return '';\n  const listItems = itemsList.map((item) => `<li>${item}</li>`).join('');\n  return `<p><strong>${title}</strong></p><ul>${listItems}</ul>`;\n};\n\nconst html = [\n  `<p><strong>Ticket:</strong> ${data.ticket_id || ''}</p>`,\n  renderList('Описание', rag.description),\n  renderList('Причины', rag.causes),\n  renderList('Действия', rag.actions),\n  renderList('Дальнейшие шаги', rag.next_steps)\n].filter(Boolean).join('');\n\nreturn [{ json: { html, ticket_id: data.ticket_id } }];"
+          "bodyParametersJson": "={\n  \"ticket_id\": $json.ticket_id,\n  \"text\": $json.text\n}"
         }
       },
       {
@@ -92,7 +78,7 @@
         "type": "n8n-nodes-base.httpRequest",
         "typeVersion": 4,
         "position": [
-          960,
+          720,
           120
         ],
         "parameters": {
@@ -102,7 +88,7 @@
           "url": "={{$env.NAUMEN_API_URL || 'https://naumen.example/api/tickets/' + $json.ticket_id + '/comments'}}",
           "sendBody": true,
           "jsonParameters": true,
-          "bodyParametersJson": "={\n  \"html\": $json.html\n}",
+          "bodyParametersJson": "={\n  \"text\": $json.comment\n}",
           "options": {
             "timeout": 120000
           }
@@ -146,17 +132,6 @@
         ]
       },
       "Call /process_ticket": {
-        "main": [
-          [
-            {
-              "node": "Format HTML",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "Format HTML": {
         "main": [
           [
             {

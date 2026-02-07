@@ -6,7 +6,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_k_m")
 
 # Qdrant
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "bank_tickets")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "kb_tickets")
 
 # Embeddings
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
