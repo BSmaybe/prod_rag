@@ -20,19 +20,25 @@ services:
 
       - VECTOR_BACKEND=${VECTOR_BACKEND:-qdrant}
       - INGEST_BACKEND=${INGEST_BACKEND:-qdrant}
+      - NO_CONTEXT_MIN_HITS=${NO_CONTEXT_MIN_HITS:-2}
+      - NO_CONTEXT_SCORE_THRESHOLD=${NO_CONTEXT_SCORE_THRESHOLD:-0.35}
 
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434/api/generate}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b-instruct-q4_k_m}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
-      - COLLECTION_NAME=${COLLECTION_NAME:-bank_tickets}
+      - COLLECTION_NAME=${COLLECTION_NAME:-kb_tickets}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-/app/model_data}
       - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
       - QDRANT_VECTOR_SIZE=${QDRANT_VECTOR_SIZE:-384}
       - QDRANT_DISTANCE=${QDRANT_DISTANCE:-Cosine}
       - SENTENCE_TRANSFORMERS_HOME=/app/st_cache
+      - DB_URL=${DB_URL:-postgresql://rag:rag@postgres:5432/rag}
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/ticket-webhook}
+      - NAUMEN_API_URL=${NAUMEN_API_URL:-https://naumen.example/api/tickets}
     depends_on:
       - qdrant
       - ollama
+      - postgres
     restart: unless-stopped
     volumes:
       - /opt/RGA-SD/data:/app/data
@@ -93,6 +99,7 @@ services:
       - N8N_TELEMETRY_ENABLED=false
       - N8N_PROTOCOL=${N8N_PROTOCOL:-http}
       - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE:-false}
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE:-true}
       - N8N_PORT=${N8N_PORT:-5678}
       - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER:-admin}
       - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD:-123}
@@ -103,11 +110,33 @@ services:
     networks:
       - app_net
 
+  postgres:
+    image: postgres:16-alpine
+    pull_policy: never
+    restart: always
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-rag}
+      - POSTGRES_USER=${POSTGRES_USER:-rag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - app_net
+
 volumes:
   qdrant_data:
   ollama_data:
   st_cache:
   n8n_data:
+  postgres_data:
 
 networks:
   app_net:

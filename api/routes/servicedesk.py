@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
+import logging
 import os
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from api.db import db_conn, ensure_schema, upsert_ticket_event
 from api.schemas.servicedesk import TicketsBatchIn
-from retriever.ingest_new import ingest_new_tickets
+from core.vectordb import upsert_tickets
+from etl.anonymize import anonymize_text
 
 router = APIRouter(prefix="/sd", tags=["service-desk"])
+log = logging.getLogger("rag.sd")
 
 
 class TicketsBatchOut(BaseModel):
@@ -22,6 +28,10 @@ class TicketsBatchOut(BaseModel):
     stored_file: str
     reindex_started: bool
     reindex_result: Optional[dict] = None
+
+
+KB_COLLECTION = os.getenv("COLLECTION_NAME", "kb_tickets")
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "").strip()
 
 
 # =========================
@@ -413,156 +423,405 @@ def _should_create_ticket_csv(issue_key: str, text: str) -> bool:
 # Route
 # =========================
 
-@router.post("/tickets", response_model=TicketsBatchOut)
+def _normalize_state(state: str) -> str:
+    return (state or "").strip().lower()
+
+
+def _is_closed_state(state: str) -> bool:
+    normalized = _normalize_state(state)
+    return normalized in {
+        "closed",
+        "close",
+        "resolved",
+        "done",
+        "completed",
+        "закрыт",
+        "закрыта",
+        "решен",
+        "решён",
+    }
+
+
+def _extract_solution_text(body: Dict[str, Any]) -> str:
+    sc = body.get("serviceCall") if isinstance(body, dict) else {}
+    if not isinstance(sc, dict):
+        sc = {}
+
+    candidates: List[str] = []
+
+    key_candidates = [
+        "solution",
+        "resolution",
+        "result",
+        "closeComment",
+        "decision",
+        "workaround",
+        "techDesc",
+        "descriptionInRTF",
+        "description",
+    ]
+    for key in key_candidates:
+        v = sc.get(key)
+        if isinstance(v, str) and v.strip():
+            candidates.append(_strip_rtf(v))
+
+    tv = sc.get("totalValue")
+    if isinstance(tv, list):
+        for item in tv:
+            if not isinstance(item, dict):
+                continue
+            title = _safe_str(item.get("title")).strip().lower()
+            text_value = item.get("textValue")
+            if text_value is None:
+                text_value = item.get("value")
+            if not isinstance(text_value, str):
+                continue
+            if any(token in title for token in ["реш", "причин", "cause", "root", "диагност", "fix"]):
+                candidates.append(_strip_rtf(text_value))
+
+    merged = "\n\n".join([c for c in candidates if c.strip()]).strip()
+    return merged
+
+
+def _looks_like_low_quality_solution(text: str) -> bool:
+    normalized = text.lower()
+    bad_patterns = [
+        r"\bсамо\s+прошл",
+        r"\bпереустанов",
+        r"\bпочистил[аи]?\s+кэш\b",
+        r"\bне\s+воспроизвел",
+        r"\bдубликат\b",
+        r"\bзакрыт[оа]?\b",
+    ]
+    return any(re.search(rx, normalized) for rx in bad_patterns)
+
+
+def _solution_quality_ok(solution_text: str, flat: Dict[str, str]) -> bool:
+    text = (solution_text or "").strip()
+    if len(text) < 300:
+        return False
+    if _looks_like_low_quality_solution(text):
+        return False
+
+    normalized = text.lower()
+    feature_count = 0
+
+    if re.search(r"(error|ошиб|exception|trace|stack|код)", normalized):
+        feature_count += 1
+    if re.search(r"(шаг|воспроизв|проверк|диагност|лог|скрин)", normalized):
+        feature_count += 1
+    if (flat.get("route") or flat.get("slm_service") or flat.get("responsible_team")):
+        feature_count += 1
+    if re.search(r"(причин|корен|изменен|изменён|change|deploy|релиз|конфиг)", normalized):
+        feature_count += 1
+
+    return feature_count >= 2
+
+
+def _build_n8n_payload(
+    *,
+    ticket_id: str,
+    text_anonymized: str,
+    trace_id: str,
+    state: str,
+    flat: Dict[str, str],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "ticket_id": ticket_id,
+        "text": text_anonymized,
+        "trace_id": trace_id,
+        "state": state,
+        "is_closed": _is_closed_state(state),
+    }
+    if flat.get("route"):
+        payload["service"] = flat.get("route")
+    if flat.get("slm_service"):
+        payload["component"] = flat.get("slm_service")
+    return payload
+
+
+async def _dispatch_n8n(payload: Dict[str, Any], request_id: str) -> None:
+    if not N8N_WEBHOOK_URL:
+        log.info("n8n_dispatch_skipped request_id=%s reason=missing_n8n_webhook_url", request_id)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            await client.post(N8N_WEBHOOK_URL, json=payload)
+        log.info("n8n_dispatched request_id=%s ticket_id=%s", request_id, payload.get("ticket_id"))
+    except Exception as e:
+        log.warning(
+            "n8n_dispatch_failed request_id=%s ticket_id=%s error=%s",
+            request_id,
+            payload.get("ticket_id"),
+            e,
+        )
+
+
+def _fetch_solution_from_naumen(ticket_id: str) -> str:
+    base_url = (os.getenv("NAUMEN_API_URL") or "").strip()
+    if not base_url:
+        return ""
+
+    if "{ticket_id}" in base_url:
+        url = base_url.format(ticket_id=ticket_id)
+    elif base_url.endswith("/"):
+        url = f"{base_url}{ticket_id}"
+    else:
+        url = f"{base_url}/{ticket_id}"
+
+    headers = {"Accept": "application/json"}
+    api_key = (os.getenv("SERVICE_API_KEY") or os.getenv("SERVICE_DESK_API_KEY") or "").strip()
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+
+    candidates = []
+    for key in ["solution", "resolution", "result", "closeComment", "techDesc", "description", "descriptionInRTF"]:
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            candidates.append(_strip_rtf(v))
+
+    sc = data.get("serviceCall")
+    if isinstance(sc, dict):
+        for key in ["solution", "resolution", "result", "closeComment", "techDesc", "description", "descriptionInRTF"]:
+            v = sc.get(key)
+            if isinstance(v, str) and v.strip():
+                candidates.append(_strip_rtf(v))
+
+    return "\n\n".join(candidates).strip()
+
+
+async def _index_closed_ticket_if_quality(
+    *,
+    ticket_id: str,
+    body: Dict[str, Any],
+    flat: Dict[str, str],
+    request_id: str,
+) -> None:
+    solution_text = _extract_solution_text(body)
+    if not solution_text:
+        solution_text = _fetch_solution_from_naumen(ticket_id)
+    if not solution_text:
+        log.info("kb_skip request_id=%s ticket_id=%s reason=no_solution_text", request_id, ticket_id)
+        return
+
+    if not _solution_quality_ok(solution_text, flat):
+        log.info("kb_skip request_id=%s ticket_id=%s reason=quality_filter", request_id, ticket_id)
+        return
+
+    record = {
+        "issue_key": ticket_id,
+        "text": solution_text,
+        "state": flat.get("state", ""),
+        "route": flat.get("route", ""),
+        "slm_service": flat.get("slm_service", ""),
+    }
+    try:
+        added = await asyncio.to_thread(upsert_tickets, [record])
+        log.info(
+            "kb_upserted request_id=%s ticket_id=%s collection=%s points=%s",
+            request_id,
+            ticket_id,
+            KB_COLLECTION,
+            added,
+        )
+    except Exception as e:
+        log.warning("kb_upsert_failed request_id=%s ticket_id=%s error=%s", request_id, ticket_id, e)
+
+
+@router.post("/tickets", response_model=TicketsBatchOut, status_code=202)
 async def ingest_from_sd(request: Request):
     raw = await request.body()
     content_type = request.headers.get("content-type", "")
+    request_id = getattr(request.state, "request_id", "-")
 
-    # dirs
     raw_dir = Path(os.getenv("SD_RAW_DIR", "data/sd_raw"))
     events_dir = Path(os.getenv("SD_EVENTS_DIR", "data/sd_events"))
     state_dir = Path(os.getenv("SD_STATE_DIR", "data/sd_state"))
-    new_tickets_dir = Path(os.getenv("NEW_TICKETS_DIR", "data/new_tickets"))
 
-    _dump_raw(raw_dir, raw, content_type)
-
+    raw_path = _dump_raw(raw_dir, raw, content_type)
     body = _try_parse_json_from_anything(raw)
 
     max_batch = _get_env_int("SD_MAX_BATCH", 500)
     max_text_len = _get_env_int("SD_MAX_TEXT_LEN", 10000)
-
-    new_tickets_dir.mkdir(parents=True, exist_ok=True)
     events_file = events_dir / "sd_events.csv"
 
+    tasks: List[asyncio.Task[Any]] = []
     accepted = 0
-    stored_file = ""
 
-    # ===== A) batch {"tickets":[...]}
-    if isinstance(body.get("tickets"), list):
-        payload = TicketsBatchIn.model_validate(body)
+    try:
+        with db_conn() as conn:
+            ensure_schema(conn)
 
-        if not payload.tickets:
-            raise HTTPException(status_code=400, detail="tickets is empty")
-        if len(payload.tickets) > max_batch:
-            raise HTTPException(status_code=413, detail=f"too many tickets (max {max_batch})")
+            if isinstance(body.get("tickets"), list):
+                payload = TicketsBatchIn.model_validate(body)
+                if not payload.tickets:
+                    raise HTTPException(status_code=400, detail="tickets is empty")
+                if len(payload.tickets) > max_batch:
+                    raise HTTPException(status_code=413, detail=f"too many tickets (max {max_batch})")
 
-        ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = new_tickets_dir / f"sd_{ts_file}.csv"
-        stored_file = str(out_path)
+                for t in payload.tickets:
+                    ticket_id = t.issue_key.strip()
+                    raw_text = (t.text or "").strip()
+                    if not ticket_id or not raw_text:
+                        continue
+                    clean_text = anonymize_text(raw_text[:max_text_len])
+                    flat = {
+                        "sc_uuid": "",
+                        "issue_key": ticket_id,
+                        "state": "new",
+                        "route": "",
+                        "slm_service": "",
+                        "priority": "",
+                        "responsible_team": "",
+                        "client_employee": "",
+                        "client_phone": "",
+                        "client_email": "",
+                        "registration_date": "",
+                        "creation_date": "",
+                        "description_plain": clean_text,
+                    }
+                    _append_events_csv(events_file, flat)
+                    key = _state_key(flat)
+                    prev = _read_state(state_dir, key)
+                    _write_state(state_dir, key, _merge_state(prev, flat))
+                    upsert_ticket_event(
+                        conn,
+                        ticket_id=ticket_id,
+                        status="new",
+                        text_anonymized=clean_text,
+                        raw_payload={"tickets_item": t.model_dump(), "parsed": body},
+                        trace_id=request_id,
+                    )
+                    tasks.append(
+                        asyncio.create_task(
+                            _dispatch_n8n(
+                                _build_n8n_payload(
+                                    ticket_id=ticket_id,
+                                    text_anonymized=clean_text,
+                                    trace_id=request_id,
+                                    state="new",
+                                    flat=flat,
+                                ),
+                                request_id,
+                            )
+                        )
+                    )
+                    accepted += 1
+            else:
+                if not _has_servicecall_uuid(body):
+                    fallback_id = _safe_str(body.get("UUID") or body.get("title") or request_id).strip() or request_id
+                    fallback_text = anonymize_text(json.dumps(body, ensure_ascii=False))[:max_text_len]
+                    upsert_ticket_event(
+                        conn,
+                        ticket_id=fallback_id,
+                        status="new",
+                        text_anonymized=fallback_text,
+                        raw_payload=body,
+                        trace_id=request_id,
+                    )
+                    return TicketsBatchOut(
+                        accepted=1,
+                        stored_file=str(raw_path),
+                        reindex_started=False,
+                        reindex_result={"skipped": "no serviceCall UUID; stored in tickets_inbox"},
+                    )
 
-        with out_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["issue_key", "text"])
-            for t in payload.tickets:
-                text = (t.text or "").strip()
-                if not text:
-                    continue
-                if len(text) > max_text_len:
+                issue_key, text, flat = _extract_event(body)
+                sc_uuid = (flat.get("sc_uuid") or "").strip()
+                ticket_id = sc_uuid or issue_key.strip()
+                if not ticket_id:
+                    ticket_id = _safe_str(body.get("UUID") or request_id).strip() or request_id
+                    upsert_ticket_event(
+                        conn,
+                        ticket_id=ticket_id,
+                        status="new",
+                        text_anonymized=anonymize_text(json.dumps(body, ensure_ascii=False))[:max_text_len],
+                        raw_payload=body,
+                        trace_id=request_id,
+                    )
+                    return TicketsBatchOut(
+                        accepted=1,
+                        stored_file=str(raw_path),
+                        reindex_started=False,
+                        reindex_result={"skipped": "empty ticket identifier; stored raw payload only"},
+                    )
+
+                if text and len(text) > max_text_len:
                     text = text[:max_text_len]
-                w.writerow([t.issue_key.strip(), text])
-                accepted += 1
+                    flat["description_plain"] = text
 
-        # events + state
-        for t in payload.tickets:
-            flat = {
-                "sc_uuid": "",
-                "issue_key": t.issue_key.strip(),
-                "state": "",
-                "route": "",
-                "slm_service": "",
-                "priority": "",
-                "responsible_team": "",
-                "client_employee": "",
-                "client_phone": "",
-                "client_email": "",
-                "registration_date": "",
-                "creation_date": "",
-                "description_plain": (t.text or "")[:max_text_len],
-            }
-            _append_events_csv(events_file, flat)
+                key = _state_key(flat)
+                prev = _read_state(state_dir, key)
+                _write_state(state_dir, key, _merge_state(prev, flat))
+                _append_events_csv(events_file, flat)
 
-            key = _state_key(flat)
-            prev = _read_state(state_dir, key)
-            merged = _merge_state(prev, flat)
-            _write_state(state_dir, key, merged)
+                clean_text = anonymize_text(text or "")
+                status = "closed" if _is_closed_state(flat.get("state", "")) else "new"
+                upsert_ticket_event(
+                    conn,
+                    ticket_id=ticket_id,
+                    status=status,
+                    text_anonymized=clean_text,
+                    raw_payload=body,
+                    trace_id=request_id,
+                )
 
-        if accepted == 0:
-            try:
-                out_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise HTTPException(status_code=400, detail="no valid tickets to ingest")
+                if clean_text:
+                    tasks.append(
+                        asyncio.create_task(
+                            _dispatch_n8n(
+                                _build_n8n_payload(
+                                    ticket_id=ticket_id,
+                                    text_anonymized=clean_text,
+                                    trace_id=request_id,
+                                    state=flat.get("state", ""),
+                                    flat=flat,
+                                ),
+                                request_id,
+                            )
+                        )
+                    )
 
-    # ===== B/C) Naumen event (или упакованный)
-    else:
-        # Скипаем "пустые" события: canceled/keyAttrChanged/newComments без message.text
-        # raw уже сохранили — этого достаточно для расследований.
-        if not _has_servicecall_uuid(body):
-            return TicketsBatchOut(
-                accepted=0,
-                stored_file="skipped: no serviceCall UUID in payload",
-                reindex_started=False,
-                reindex_result={"skipped": "no serviceCall UUID; raw saved only"},
-            )
+                if _is_closed_state(flat.get("state", "")):
+                    tasks.append(
+                        asyncio.create_task(
+                            _index_closed_ticket_if_quality(
+                                ticket_id=ticket_id,
+                                body=body,
+                                flat=flat,
+                                request_id=request_id,
+                            )
+                        )
+                    )
+                accepted = 1
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("sd_ingest_failed request_id=%s error=%s", request_id, e)
+        raise HTTPException(status_code=500, detail=f"Failed to persist SD ticket: {e}")
 
-        issue_key, text, flat = _extract_event(body)
-
-        # доп. защита: если uuid пустой — тоже скипаем, чтобы не плодить unknown
-        if (flat.get("sc_uuid") or "").strip() == "":
-            return TicketsBatchOut(
-                accepted=0,
-                stored_file="skipped: empty sc_uuid after parse",
-                reindex_started=False,
-                reindex_result={"skipped": "empty sc_uuid; raw saved only"},
-            )
-
-        # ограничим текст
-        if text and len(text) > max_text_len:
-            text = text[:max_text_len]
-            flat["description_plain"] = text
-
-        # state всегда пишем (чтобы мерджить 5-7 событий)
-        key = _state_key(flat)
-        prev = _read_state(state_dir, key)
-        merged = _merge_state(prev, flat)
-        _write_state(state_dir, key, merged)
-
-        # events пишем всегда (даже если текст пустой)
-        _append_events_csv(events_file, flat)
-
-        # new_tickets создаём только если есть нормальный текст и issue_key
-        if _should_create_ticket_csv(issue_key, text):
-            ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = new_tickets_dir / f"sd_{ts_file}.csv"
-            stored_file = str(out_path)
-
-            with out_path.open("w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["issue_key", "text"])
-                w.writerow([issue_key, text])
-
-            accepted = 1
-        else:
-            accepted = 0
-            stored_file = "no new_tickets created (event had no serviceCall description)"
-
-    # reindex (только если реально создали new_tickets)
-    reindex_started = False
-    reindex_result: Optional[dict] = None
-    if accepted > 0:
-        try:
-            reindex_started = True
-            res = ingest_new_tickets()
-            reindex_result = res if isinstance(res, dict) else {"result": str(res)}
-        except Exception as e:
-            reindex_started = False
-            reindex_result = {"error": str(e)}
-    else:
-        reindex_result = {"skipped": "no valid ticket text; only state/events updated"}
+    log.info(
+        "sd_ingest request_id=%s accepted=%s async_tasks=%s raw_file=%s",
+        request_id,
+        accepted,
+        len(tasks),
+        raw_path,
+    )
 
     return TicketsBatchOut(
         accepted=accepted,
-        stored_file=stored_file,
-        reindex_started=reindex_started,
-        reindex_result=reindex_result,
+        stored_file=str(raw_path),
+        reindex_started=bool(tasks),
+        reindex_result={"queued_tasks": len(tasks), "collection": KB_COLLECTION},
     )
