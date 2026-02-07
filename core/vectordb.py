@@ -206,34 +206,43 @@ def upsert_tickets(records: Iterable[Dict[str, str]], service: Optional[str] = N
     points: List[PointStruct] = []
     for r in rows:
         issue_key = str(r.get("issue_key", "")).strip()
-        raw_text = str(r.get("text", "")).strip()
-        if not issue_key or not raw_text:
+        raw_problem = str(r.get("text", "")).strip()
+        raw_solution = str(r.get("solution_text", "")).strip()
+        if not issue_key or not raw_problem:
             continue
 
-        text = anonymize_text(raw_text)
-        if not text:
+        problem_text = anonymize_text(raw_problem)
+        solution_text = anonymize_text(raw_solution) if raw_solution else ""
+        if not problem_text:
             continue
+
+        if solution_text:
+            indexed_text = f"Проблема:\n{problem_text}\n\nРешение:\n{solution_text}"
+        else:
+            indexed_text = problem_text
 
         payload = {
             "issue_key": issue_key,
-            "text_chunk": text,
-            "snippet": text[:300],
-            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "text_chunk": indexed_text,
+            "problem_text": problem_text,
+            "solution_text": solution_text,
+            "snippet": indexed_text[:300],
+            "text_hash": hashlib.sha256(indexed_text.encode("utf-8")).hexdigest(),
         }
         if service or r.get("service"):
             payload["service"] = service or r.get("service")
 
         # Any extra string fields must be anonymized before storing in Qdrant.
         for k, v in r.items():
-            if k in {"issue_key", "text", "service"}:
+            if k in {"issue_key", "text", "solution_text", "service"}:
                 continue
             if isinstance(v, str):
                 payload[k] = anonymize_text(v)
             elif isinstance(v, (int, float, bool)) or v is None:
                 payload[k] = v
 
-        vec = _encode_passage(text)
-        point_id = _make_point_id(issue_key, text)
+        vec = _encode_passage(indexed_text)
+        point_id = _make_point_id(issue_key, indexed_text)
         points.append(PointStruct(id=point_id, vector=vec, payload=payload))
 
     if not points:

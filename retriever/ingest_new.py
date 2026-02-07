@@ -16,7 +16,10 @@ NEW_TICKETS_DIR = os.getenv("NEW_TICKETS_DIR", "/data/new_tickets")
 def _load_csv_rows() -> List[Dict[str, str]]:
     """
     Читает все *.csv из NEW_TICKETS_DIR.
-    Ожидает столбцы: issue_key, text
+    Поддерживает столбцы:
+      - issue_key (required)
+      - text (required)
+      - solution_text (optional)
     """
     rows: List[Dict[str, str]] = []
 
@@ -32,7 +35,11 @@ def _load_csv_rows() -> List[Dict[str, str]]:
                 text = (r.get("text") or "").strip()
                 if not issue_key or not text:
                     continue
-                rows.append({"issue_key": issue_key, "text": text})
+                solution_text = (r.get("solution_text") or "").strip()
+                row: Dict[str, str] = {"issue_key": issue_key, "text": text}
+                if solution_text:
+                    row["solution_text"] = solution_text
+                rows.append(row)
 
     return rows
 
