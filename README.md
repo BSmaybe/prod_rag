@@ -45,6 +45,15 @@ docker compose up --build -d
 curl http://localhost:8080/readyz
 ```
 
+## Bulk ingest CSV format
+`POST /manage/reindex` читает CSV из `NEW_TICKETS_DIR` с таким форматом:
+
+- Минимальный (обратная совместимость): `issue_key,text`
+- Расширенный: `issue_key,text,solution_text`
+
+Если `solution_text` передан, в Qdrant индексируется объединённый текст `problem + solution`.
+В payload сохраняются раздельные поля: `problem_text`, `solution_text`, `text_chunk`.
+
 ## Qdrant reset/reload
 1. Остановить входящий callback поток из Naumen.
 2. Удалить коллекцию:
