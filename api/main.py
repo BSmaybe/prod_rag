@@ -291,10 +291,10 @@ def form_alias():
 
 @app.post("/ask")
 def ask(
+    request: Request,
     issue_text: str = Form(...),
     context_count: int = Form(20),
     service: str | None = Form(None),
-    request: Request | None = None,
 ):
     """
     1) Ищем контекст (RAG)
@@ -395,7 +395,7 @@ def ask(
 @app.post("/process_ticket")
 async def process_ticket(
     request: TicketRequest,
-    http_request: Request | None = None,
+    http_request: Request,
 ):
     clean_text = anonymize_text((request.text or "").strip())
     if not clean_text:
