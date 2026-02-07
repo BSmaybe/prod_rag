@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 import httpx
-from fastapi import FastAPI, Form, Header, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -395,13 +395,8 @@ def ask(
 @app.post("/process_ticket")
 async def process_ticket(
     request: TicketRequest,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     http_request: Request | None = None,
 ):
-    service_api_key = os.getenv("SERVICE_API_KEY") or os.getenv("SERVICE_DESK_API_KEY")
-    if service_api_key and x_api_key != service_api_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     clean_text = anonymize_text((request.text or "").strip())
     if not clean_text:
         raise HTTPException(status_code=400, detail="text must not be empty")
