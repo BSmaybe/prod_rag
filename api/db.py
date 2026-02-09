@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -52,6 +53,15 @@ def db_conn() -> Generator[psycopg.Connection, None, None]:
         conn.close()
 
 
+def _payload_hash(payload: dict[str, Any]) -> str:
+    """
+    Делаем стабильный sha256 от payload (json canonical).
+    Используем для дедупа outbox.
+    """
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -80,12 +90,15 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             ON tickets_inbox(updated_at DESC);
             """
         )
+
+        # outbox
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS n8n_outbox (
                 id bigserial PRIMARY KEY,
                 ticket_id text NOT NULL,
                 payload jsonb NOT NULL,
+                payload_hash text NOT NULL DEFAULT '',
                 status text NOT NULL DEFAULT 'pending',
                 attempts int NOT NULL DEFAULT 0,
                 next_retry_at timestamptz NOT NULL DEFAULT now(),
@@ -95,6 +108,14 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             );
             """
         )
+
+        # миграции для существующей таблицы
+        cur.execute("ALTER TABLE n8n_outbox ADD COLUMN IF NOT EXISTS payload_hash text;")
+        cur.execute("UPDATE n8n_outbox SET payload_hash = '' WHERE payload_hash IS NULL;")
+        cur.execute("ALTER TABLE n8n_outbox ALTER COLUMN payload_hash SET DEFAULT '';")
+        cur.execute("ALTER TABLE n8n_outbox ALTER COLUMN payload_hash SET NOT NULL;")
+
+        # индекс для обработки
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_n8n_outbox_status_next_retry
@@ -107,6 +128,15 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             ON n8n_outbox(ticket_id);
             """
         )
+
+        # ЖЁСТКИЙ дедуп: один и тот же payload на один ticket — только 1 раз
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_n8n_outbox_ticket_payloadhash
+            ON n8n_outbox(ticket_id, payload_hash);
+            """
+        )
+
     conn.commit()
 
 
@@ -180,18 +210,41 @@ def enqueue_outbox_event(
     status: str = "pending",
     autocommit: bool = True,
 ) -> int:
-    outbox_id = 0
+    """
+    Кладём событие в outbox.
+    Дедупаем на уровне БД по (ticket_id, payload_hash).
+    Если дубль — вернём id уже существующей записи.
+    """
+    ph = _payload_hash(payload)
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO n8n_outbox (ticket_id, payload, status)
-            VALUES (%s, %s::jsonb, %s)
+            INSERT INTO n8n_outbox (ticket_id, payload, payload_hash, status)
+            VALUES (%s, %s::jsonb, %s, %s)
+            ON CONFLICT (ticket_id, payload_hash) DO NOTHING
             RETURNING id;
             """,
-            (ticket_id, json.dumps(payload, ensure_ascii=False), status),
+            (ticket_id, payload_json, ph, status),
         )
         row = cur.fetchone()
-        outbox_id = int(row[0]) if row else 0
+        if row:
+            outbox_id = int(row[0])
+        else:
+            # уже существовало — достанем id
+            cur.execute(
+                """
+                SELECT id FROM n8n_outbox
+                WHERE ticket_id = %s AND payload_hash = %s
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (ticket_id, ph),
+            )
+            row2 = cur.fetchone()
+            outbox_id = int(row2[0]) if row2 else 0
+
     if autocommit:
         conn.commit()
     return outbox_id
@@ -220,7 +273,7 @@ def claim_outbox_batch(
                 updated_at = now()
             FROM picked
             WHERE o.id = picked.id
-            RETURNING o.id, o.ticket_id, o.payload, o.status, o.attempts,
+            RETURNING o.id, o.ticket_id, o.payload, o.payload_hash, o.status, o.attempts,
                       o.next_retry_at, o.last_error, o.created_at, o.updated_at;
             """,
             (limit,),

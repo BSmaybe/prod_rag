@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import html
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
@@ -48,19 +49,35 @@ def _safe_str(v: Any) -> str:
     return "" if v is None else str(v)
 
 
+def _normalize_text(s: str) -> str:
+    """
+    Единая нормализация текста:
+    - html entities (&nbsp; и т.п.) -> юникод
+    - \xa0 -> пробел
+    - схлопывание пробелов
+    """
+    if not s:
+        return ""
+    s = html.unescape(s)
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _strip_rtf(text: str) -> str:
     """
     Упрощённая очистка:
     - html теги
     - rtf-эскейпы вида \par \b0 \u1234 ...
+    - декодирование HTML entities (&nbsp; и т.п.)
     """
     if not text:
         return ""
-    t = text
+    t = html.unescape(text)
     t = re.sub(r"<[^>]+>", " ", t)               # html tags
     t = re.sub(r"\\[a-zA-Z]+\d*", " ", t)        # rtf escapes
     t = re.sub(r"[\{\}]", " ", t)                # braces
-    return re.sub(r"\s+", " ", t).strip()
+    return _normalize_text(t)
 
 
 def _get_in(d: Dict[str, Any], path: List[str], default: Any = "") -> Any:
@@ -82,7 +99,7 @@ def _dump_raw(raw_dir: Path, raw_bytes: bytes, content_type: str) -> Path:
     p.write_bytes(raw_bytes)
     meta.write_text(
         f"content-type: {content_type}\nlen: {len(raw_bytes)}\n",
-        encoding="utf-8"
+        encoding="utf-8",
     )
     return p
 
@@ -97,22 +114,16 @@ def _try_parse_json_from_anything(raw_bytes: bytes) -> Dict[str, Any]:
           "text": "{ \"header\": {...}, \"serviceCall\": {...} }"
       }
     }
-
-    Мы должны:
-    1) Распарсить внешний JSON
-    2) Если есть message.text — распарсить JSON из него
-    3) Иначе пробовать старые варианты
     """
     s = raw_bytes.decode("utf-8", errors="replace").strip()
 
-    # 1) пробуем внешний JSON
     try:
         outer = json.loads(s)
     except Exception:
         outer = None
 
     if isinstance(outer, dict):
-        # 2) ГЛАВНОЕ — message.text
+        # 1) главное — message.text
         try:
             msg = outer.get("message")
             if isinstance(msg, dict):
@@ -126,7 +137,7 @@ def _try_parse_json_from_anything(raw_bytes: bytes) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # 3) старый вариант — вдруг text на верхнем уровне
+        # 2) вдруг text на верхнем уровне
         try:
             txt = outer.get("text")
             if isinstance(txt, str):
@@ -138,10 +149,10 @@ def _try_parse_json_from_anything(raw_bytes: bytes) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # 4) если это batch {"tickets":[...]}
+        # 3) batch {"tickets":[...]}
         return outer
 
-    # 5) fallback — JSON внутри строки
+    # 4) fallback — JSON внутри строки
     i = s.find("{")
     j = s.rfind("}")
     if i != -1 and j != -1 and j > i:
@@ -157,10 +168,6 @@ def _try_parse_json_from_anything(raw_bytes: bytes) -> Dict[str, Any]:
 
 
 def _has_servicecall_uuid(body: Dict[str, Any]) -> bool:
-    """
-    True если payload содержит хотя бы какой-то serviceCall.UUID
-    (в serviceCall или header.serviceCall)
-    """
     if not isinstance(body, dict):
         return False
     sc = body.get("serviceCall") or {}
@@ -171,14 +178,13 @@ def _has_servicecall_uuid(body: Dict[str, Any]) -> bool:
         sc_uuid = _safe_str(sc.get("UUID") or "")
     if not sc_uuid and isinstance(hdr_sc, dict):
         sc_uuid = _safe_str(hdr_sc.get("UUID") or "")
-
     return bool(sc_uuid.strip())
 
 
 def _extract_event(body: Dict[str, Any]) -> Tuple[str, str, Dict[str, str]]:
     """
-    Пытаемся собрать максимальный плоский event из serviceCall.
-    Возвращаем (issue_key, text, flat)
+    Собираем плоский event из serviceCall.
+    Возвращаем (issue_key, description_plain, flat)
     """
     hdr_sc = _get_in(body, ["header", "serviceCall"], default={})
     sc = body.get("serviceCall") or {}
@@ -187,7 +193,6 @@ def _extract_event(body: Dict[str, Any]) -> Tuple[str, str, Dict[str, str]]:
     issue_key = _safe_str((hdr_sc.get("title") if isinstance(hdr_sc, dict) else None) or sc.get("title") or sc_uuid or "unknown")
     state = _safe_str(sc.get("state") or (hdr_sc.get("state") if isinstance(hdr_sc, dict) else "") or "")
 
-    # описание может быть в разных местах
     desc_rtf = (
         _safe_str(sc.get("descriptionInRTF"))
         or _safe_str(sc.get("techDesc"))
@@ -209,7 +214,7 @@ def _extract_event(body: Dict[str, Any]) -> Tuple[str, str, Dict[str, str]]:
     reg_dt = _safe_str(sc.get("registrationDate") or "")
     creation_dt = _safe_str(sc.get("creationDate") or "")
 
-    # totalValue разворачиваем в tv_*
+    # totalValue -> tv_*
     tv_list = sc.get("totalValue") or []
     tv_flat: Dict[str, str] = {}
     if isinstance(tv_list, list):
@@ -281,7 +286,6 @@ def _append_events_csv(path: Path, flat: Dict[str, str]) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = {"ts": ts, **flat}
 
-    # Дедуп: если последняя строка по сути такая же — не пишем новую
     last = _last_csv_row(path)
     if last is not None:
         cmp_cols = [
@@ -306,7 +310,6 @@ def _append_events_csv(path: Path, flat: Dict[str, str]) -> None:
             w.writerow({c: row.get(c, "") for c in cols})
         return
 
-    # читаем существующие колонки
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         existing_cols = next(reader, [])
@@ -316,7 +319,6 @@ def _append_events_csv(path: Path, flat: Dict[str, str]) -> None:
         if k not in new_cols:
             new_cols.append(k)
 
-    # если колонки расширились — перепишем файл с новым header
     if new_cols != existing_cols:
         with path.open("r", newline="", encoding="utf-8") as f:
             old_rows = list(csv.DictReader(f))
@@ -334,10 +336,6 @@ def _append_events_csv(path: Path, flat: Dict[str, str]) -> None:
 
 
 def _state_key(flat: Dict[str, str]) -> str:
-    """
-    Для merge по тикету.
-    Предпочтительно serviceCall UUID, иначе issue_key.
-    """
     sc_uuid = (flat.get("sc_uuid") or "").strip()
     if sc_uuid:
         return sc_uuid
@@ -346,19 +344,12 @@ def _state_key(flat: Dict[str, str]) -> str:
 
 
 def _merge_state(prev: Dict[str, Any], flat: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Апдейт состояния тикета:
-    - не затирать непустые значения пустыми
-    - events хранить списком (последние N)
-    - дедуп одинаковых подряд событий
-    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     out = dict(prev or {})
     out.setdefault("updated_at", now)
     out.setdefault("created_at", now)
     out["updated_at"] = now
 
-    # поля
     for k, v in flat.items():
         v = _safe_str(v).strip()
         if v:
@@ -366,7 +357,6 @@ def _merge_state(prev: Dict[str, Any], flat: Dict[str, str]) -> Dict[str, Any]:
         else:
             out.setdefault(k, "")
 
-    # события (последние 50) + дедуп по последней записи
     ev = {
         "ts": now,
         "state": flat.get("state", ""),
@@ -380,15 +370,12 @@ def _merge_state(prev: Dict[str, Any], flat: Dict[str, str]) -> Dict[str, Any]:
         if not out["events"] or out["events"][-1] != ev:
             out["events"].append(ev)
         out["events"] = out["events"][-50:]
-
     return out
 
 
 def _write_state(state_dir: Path, state_key: str, state: Dict[str, Any]) -> Path:
     state_dir.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^a-zA-Z0-9_\-$\.]", "_", state_key)
-    if not safe:
-        safe = "unknown"
+    safe = re.sub(r"[^a-zA-Z0-9_\-$\.]", "_", state_key) or "unknown"
     p = state_dir / f"{safe}.json"
     p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
@@ -405,22 +392,31 @@ def _read_state(state_dir: Path, state_key: str) -> Dict[str, Any]:
         return {}
 
 
-def _should_create_ticket_csv(issue_key: str, text: str) -> bool:
+def _same_as_last_event(prev_state: Dict[str, Any], flat: Dict[str, str]) -> bool:
     """
-    Создаём new_tickets CSV только если:
-    - issue_key не unknown
-    - есть непустой текст
+    Дедуп для outbox: если событие по смыслу совпадает с последним — не шлем.
+    (ts игнорируем)
     """
-    if not issue_key or issue_key.strip().lower() == "unknown":
+    last = None
+    if isinstance(prev_state, dict):
+        events = prev_state.get("events")
+        if isinstance(events, list) and events:
+            last = events[-1]
+    if not isinstance(last, dict):
         return False
-    if not text or not text.strip():
-        return False
+
+    cur = {
+        "state": flat.get("state", ""),
+        "route": flat.get("route", ""),
+        "priority": flat.get("priority", ""),
+        "responsible_team": flat.get("responsible_team", ""),
+        "description_plain": (flat.get("description_plain", "") or "")[:500],
+    }
+    for k, v in cur.items():
+        if _safe_str(last.get(k, "")) != _safe_str(v):
+            return False
     return True
 
-
-# =========================
-# Route
-# =========================
 
 def _normalize_state(state: str) -> str:
     return (state or "").strip().lower()
@@ -441,82 +437,6 @@ def _is_closed_state(state: str) -> bool:
     }
 
 
-def _extract_solution_text(body: Dict[str, Any]) -> str:
-    sc = body.get("serviceCall") if isinstance(body, dict) else {}
-    if not isinstance(sc, dict):
-        sc = {}
-
-    candidates: List[str] = []
-
-    key_candidates = [
-        "solution",
-        "resolution",
-        "result",
-        "closeComment",
-        "decision",
-        "workaround",
-        "techDesc",
-        "descriptionInRTF",
-        "description",
-    ]
-    for key in key_candidates:
-        v = sc.get(key)
-        if isinstance(v, str) and v.strip():
-            candidates.append(_strip_rtf(v))
-
-    tv = sc.get("totalValue")
-    if isinstance(tv, list):
-        for item in tv:
-            if not isinstance(item, dict):
-                continue
-            title = _safe_str(item.get("title")).strip().lower()
-            text_value = item.get("textValue")
-            if text_value is None:
-                text_value = item.get("value")
-            if not isinstance(text_value, str):
-                continue
-            if any(token in title for token in ["реш", "причин", "cause", "root", "диагност", "fix"]):
-                candidates.append(_strip_rtf(text_value))
-
-    merged = "\n\n".join([c for c in candidates if c.strip()]).strip()
-    return merged
-
-
-def _looks_like_low_quality_solution(text: str) -> bool:
-    normalized = text.lower()
-    bad_patterns = [
-        r"\bсамо\s+прошл",
-        r"\bпереустанов",
-        r"\bпочистил[аи]?\s+кэш\b",
-        r"\bне\s+воспроизвел",
-        r"\bдубликат\b",
-        r"\bзакрыт[оа]?\b",
-    ]
-    return any(re.search(rx, normalized) for rx in bad_patterns)
-
-
-def _solution_quality_ok(solution_text: str, flat: Dict[str, str]) -> bool:
-    text = (solution_text or "").strip()
-    if len(text) < 300:
-        return False
-    if _looks_like_low_quality_solution(text):
-        return False
-
-    normalized = text.lower()
-    feature_count = 0
-
-    if re.search(r"(error|ошиб|exception|trace|stack|код)", normalized):
-        feature_count += 1
-    if re.search(r"(шаг|воспроизв|проверк|диагност|лог|скрин)", normalized):
-        feature_count += 1
-    if (flat.get("route") or flat.get("slm_service") or flat.get("responsible_team")):
-        feature_count += 1
-    if re.search(r"(причин|корен|изменен|изменён|change|deploy|релиз|конфиг)", normalized):
-        feature_count += 1
-
-    return feature_count >= 2
-
-
 def _build_n8n_payload(
     *,
     ticket_id: str,
@@ -527,7 +447,7 @@ def _build_n8n_payload(
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "ticket_id": ticket_id,
-        "text": text_anonymized,
+        "text": _normalize_text(text_anonymized),  # страховка от &nbsp;/\xa0
         "trace_id": trace_id,
         "state": state,
         "is_closed": _is_closed_state(state),
@@ -539,87 +459,9 @@ def _build_n8n_payload(
     return payload
 
 
-def _fetch_solution_from_naumen(ticket_id: str) -> str:
-    base_url = (os.getenv("NAUMEN_API_URL") or "").strip()
-    if not base_url:
-        return ""
-
-    if "{ticket_id}" in base_url:
-        url = base_url.format(ticket_id=ticket_id)
-    elif base_url.endswith("/"):
-        url = f"{base_url}{ticket_id}"
-    else:
-        url = f"{base_url}/{ticket_id}"
-
-    headers = {"Accept": "application/json"}
-    api_key = (os.getenv("SERVICE_API_KEY") or os.getenv("SERVICE_DESK_API_KEY") or "").strip()
-    if api_key:
-        headers["X-API-Key"] = api_key
-
-    try:
-        with httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
-            resp = client.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception:
-        return ""
-
-    if not isinstance(data, dict):
-        return ""
-
-    candidates = []
-    for key in ["solution", "resolution", "result", "closeComment", "techDesc", "description", "descriptionInRTF"]:
-        v = data.get(key)
-        if isinstance(v, str) and v.strip():
-            candidates.append(_strip_rtf(v))
-
-    sc = data.get("serviceCall")
-    if isinstance(sc, dict):
-        for key in ["solution", "resolution", "result", "closeComment", "techDesc", "description", "descriptionInRTF"]:
-            v = sc.get(key)
-            if isinstance(v, str) and v.strip():
-                candidates.append(_strip_rtf(v))
-
-    return "\n\n".join(candidates).strip()
-
-
-async def _index_closed_ticket_if_quality(
-    *,
-    ticket_id: str,
-    body: Dict[str, Any],
-    flat: Dict[str, str],
-    request_id: str,
-) -> None:
-    solution_text = _extract_solution_text(body)
-    if not solution_text:
-        solution_text = _fetch_solution_from_naumen(ticket_id)
-    if not solution_text:
-        log.info("kb_skip request_id=%s ticket_id=%s reason=no_solution_text", request_id, ticket_id)
-        return
-
-    if not _solution_quality_ok(solution_text, flat):
-        log.info("kb_skip request_id=%s ticket_id=%s reason=quality_filter", request_id, ticket_id)
-        return
-
-    record = {
-        "issue_key": ticket_id,
-        "text": solution_text,
-        "state": flat.get("state", ""),
-        "route": flat.get("route", ""),
-        "slm_service": flat.get("slm_service", ""),
-    }
-    try:
-        added = await asyncio.to_thread(upsert_tickets, [record])
-        log.info(
-            "kb_upserted request_id=%s ticket_id=%s collection=%s points=%s",
-            request_id,
-            ticket_id,
-            KB_COLLECTION,
-            added,
-        )
-    except Exception as e:
-        log.warning("kb_upsert_failed request_id=%s ticket_id=%s error=%s", request_id, ticket_id, e)
-
+# =========================
+# Route
+# =========================
 
 @router.post("/tickets", response_model=TicketsBatchOut, status_code=202)
 async def ingest_from_sd(request: Request):
@@ -638,7 +480,6 @@ async def ingest_from_sd(request: Request):
     max_text_len = _get_env_int("SD_MAX_TEXT_LEN", 10000)
     events_file = events_dir / "sd_events.csv"
 
-    kb_tasks: List[asyncio.Task[Any]] = []
     outbox_enqueued = 0
     accepted = 0
 
@@ -646,6 +487,9 @@ async def ingest_from_sd(request: Request):
         with db_conn() as conn:
             ensure_schema(conn)
 
+            # =========================
+            # Batch: {"tickets":[...]}
+            # =========================
             if isinstance(body.get("tickets"), list):
                 payload = TicketsBatchIn.model_validate(body)
                 if not payload.tickets:
@@ -654,11 +498,16 @@ async def ingest_from_sd(request: Request):
                     raise HTTPException(status_code=413, detail=f"too many tickets (max {max_batch})")
 
                 for t in payload.tickets:
-                    ticket_id = t.issue_key.strip()
-                    raw_text = (t.text or "").strip()
-                    if not ticket_id or not raw_text:
+                    ticket_id = (t.issue_key or "").strip()
+                    if not ticket_id:
                         continue
-                    clean_text = anonymize_text(raw_text[:max_text_len])
+
+                    raw_text = _normalize_text((t.text or "")[:max_text_len])
+                    if not raw_text:
+                        continue
+
+                    clean_text = anonymize_text(raw_text)
+
                     flat = {
                         "sc_uuid": "",
                         "issue_key": ticket_id,
@@ -674,10 +523,14 @@ async def ingest_from_sd(request: Request):
                         "creation_date": "",
                         "description_plain": clean_text,
                     }
-                    _append_events_csv(events_file, flat)
+
                     key = _state_key(flat)
                     prev = _read_state(state_dir, key)
+                    is_dup = _same_as_last_event(prev, flat)
+
                     _write_state(state_dir, key, _merge_state(prev, flat))
+                    _append_events_csv(events_file, flat)
+
                     upsert_ticket_event(
                         conn,
                         ticket_id=ticket_id,
@@ -687,31 +540,33 @@ async def ingest_from_sd(request: Request):
                         trace_id=request_id,
                         autocommit=False,
                     )
-                    outbox_id = enqueue_outbox_event(
-                        conn,
-                        ticket_id=ticket_id,
-                        payload=_build_n8n_payload(
+
+                    if not is_dup:
+                        outbox_id = enqueue_outbox_event(
+                            conn,
                             ticket_id=ticket_id,
-                            text_anonymized=clean_text,
-                            trace_id=request_id,
-                            state="new",
-                            flat=flat,
-                        ),
-                        autocommit=False,
-                    )
+                            payload=_build_n8n_payload(
+                                ticket_id=ticket_id,
+                                text_anonymized=clean_text,
+                                trace_id=request_id,
+                                state="new",
+                                flat=flat,
+                            ),
+                            autocommit=False,
+                        )
+                        outbox_enqueued += 1
+                        log.info("outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s", request_id, ticket_id, outbox_id)
+
                     conn.commit()
-                    outbox_enqueued += 1
-                    log.info(
-                        "outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s",
-                        request_id,
-                        ticket_id,
-                        outbox_id,
-                    )
                     accepted += 1
+
+            # =========================
+            # Single event: {"header":...,"serviceCall":...}
+            # =========================
             else:
                 if not _has_servicecall_uuid(body):
                     fallback_id = _safe_str(body.get("UUID") or body.get("title") or request_id).strip() or request_id
-                    fallback_text = anonymize_text(json.dumps(body, ensure_ascii=False))[:max_text_len]
+                    fallback_text = anonymize_text(_normalize_text(json.dumps(body, ensure_ascii=False))[:max_text_len])
                     upsert_ticket_event(
                         conn,
                         ticket_id=fallback_id,
@@ -719,6 +574,7 @@ async def ingest_from_sd(request: Request):
                         text_anonymized=fallback_text,
                         raw_payload=body,
                         trace_id=request_id,
+                        autocommit=True,
                     )
                     return TicketsBatchOut(
                         accepted=1,
@@ -732,13 +588,15 @@ async def ingest_from_sd(request: Request):
                 ticket_id = sc_uuid or issue_key.strip()
                 if not ticket_id:
                     ticket_id = _safe_str(body.get("UUID") or request_id).strip() or request_id
+                    raw_dump = _normalize_text(json.dumps(body, ensure_ascii=False))[:max_text_len]
                     upsert_ticket_event(
                         conn,
                         ticket_id=ticket_id,
                         status="new",
-                        text_anonymized=anonymize_text(json.dumps(body, ensure_ascii=False))[:max_text_len],
+                        text_anonymized=anonymize_text(raw_dump),
                         raw_payload=body,
                         trace_id=request_id,
+                        autocommit=True,
                     )
                     return TicketsBatchOut(
                         accepted=1,
@@ -753,11 +611,14 @@ async def ingest_from_sd(request: Request):
 
                 key = _state_key(flat)
                 prev = _read_state(state_dir, key)
+                is_dup = _same_as_last_event(prev, flat)
+
                 _write_state(state_dir, key, _merge_state(prev, flat))
                 _append_events_csv(events_file, flat)
 
-                clean_text = anonymize_text(text or "")
+                clean_text = anonymize_text(_normalize_text(text or ""))
                 status = "closed" if _is_closed_state(flat.get("state", "")) else "new"
+
                 upsert_ticket_event(
                     conn,
                     ticket_id=ticket_id,
@@ -768,7 +629,7 @@ async def ingest_from_sd(request: Request):
                     autocommit=False,
                 )
 
-                if clean_text:
+                if clean_text and not is_dup:
                     outbox_id = enqueue_outbox_event(
                         conn,
                         ticket_id=ticket_id,
@@ -782,26 +643,11 @@ async def ingest_from_sd(request: Request):
                         autocommit=False,
                     )
                     outbox_enqueued += 1
-                    log.info(
-                        "outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s",
-                        request_id,
-                        ticket_id,
-                        outbox_id,
-                    )
-                conn.commit()
+                    log.info("outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s", request_id, ticket_id, outbox_id)
 
-                if _is_closed_state(flat.get("state", "")):
-                    kb_tasks.append(
-                        asyncio.create_task(
-                            _index_closed_ticket_if_quality(
-                                ticket_id=ticket_id,
-                                body=body,
-                                flat=flat,
-                                request_id=request_id,
-                            )
-                        )
-                    )
+                conn.commit()
                 accepted = 1
+
     except HTTPException:
         raise
     except Exception as e:
@@ -809,21 +655,19 @@ async def ingest_from_sd(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to persist SD ticket: {e}")
 
     log.info(
-        "sd_ingest request_id=%s accepted=%s outbox_enqueued=%s kb_tasks=%s raw_file=%s",
+        "sd_ingest request_id=%s accepted=%s outbox_enqueued=%s raw_file=%s",
         request_id,
         accepted,
         outbox_enqueued,
-        len(kb_tasks),
         raw_path,
     )
 
     return TicketsBatchOut(
         accepted=accepted,
         stored_file=str(raw_path),
-        reindex_started=bool(outbox_enqueued or kb_tasks),
+        reindex_started=bool(outbox_enqueued),
         reindex_result={
             "outbox_enqueued": outbox_enqueued,
-            "kb_tasks": len(kb_tasks),
             "collection": KB_COLLECTION,
         },
     )

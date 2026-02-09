@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim
+FROM local-python:3.11-slim
 
 ARG http_proxy
 ARG https_proxy

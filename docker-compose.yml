@@ -42,12 +42,15 @@ services:
       - DB_URL=${DB_URL:-postgresql://rag:rag@postgres:5432/rag}
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/ticket-webhook}
       - NAUMEN_API_URL=${NAUMEN_API_URL:-https://naumen.example/api/tickets}
-      - http_proxy=${http_proxy:-}
-      - https_proxy=${https_proxy:-}
-      - no_proxy=${no_proxy:-}
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - NO_PROXY=${NO_PROXY:-}
+      # --- PROXY (исправлено!) ---
+      - http_proxy=http://proxy-ws.cbank.kz:8080
+      - https_proxy=http://proxy-ws.cbank.kz:8080
+      - HTTP_PROXY=http://proxy-ws.cbank.kz:8080
+      - HTTPS_PROXY=http://proxy-ws.cbank.kz:8080
+
+      # КРИТИЧНО: отключаем proxy для docker-сети
+      - no_proxy=localhost,127.0.0.1,::1,n8n,api,qdrant,ollama,postgres,172.18.0.0/16
+      - NO_PROXY=localhost,127.0.0.1,::1,n8n,api,qdrant,ollama,postgres,172.18.0.0/16
     depends_on:
       - qdrant
       - ollama
