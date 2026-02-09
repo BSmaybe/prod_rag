@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import html
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
@@ -53,13 +54,22 @@ def _strip_rtf(text: str) -> str:
     Упрощённая очистка:
     - html теги
     - rtf-эскейпы вида \par \b0 \u1234 ...
+    - декодирование HTML entities (&nbsp; и т.п.)
     """
     if not text:
         return ""
     t = text
+
+    # 0) decode HTML entities early
+    t = html.unescape(t)  # <-- добавь это
+
     t = re.sub(r"<[^>]+>", " ", t)               # html tags
     t = re.sub(r"\\[a-zA-Z]+\d*", " ", t)        # rtf escapes
     t = re.sub(r"[\{\}]", " ", t)                # braces
+
+    # на всякий: после unescape nbsp может стать \xa0
+    t = t.replace("\xa0", " ")
+
     return re.sub(r"\s+", " ", t).strip()
 
 
