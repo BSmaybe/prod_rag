@@ -30,25 +30,27 @@ services:
       - NO_CONTEXT_MIN_HITS=${NO_CONTEXT_MIN_HITS:-2}
       - NO_CONTEXT_SCORE_THRESHOLD=${NO_CONTEXT_SCORE_THRESHOLD:-0.35}
 
+      # LLM через Ollama
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434/api/generate}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b-instruct-q4_k_m}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3-14b-q4km}
+
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
-      - COLLECTION_NAME=${COLLECTION_NAME}
+      - COLLECTION_NAME=${COLLECTION_NAME:-kb_tickets}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-/app/model_data}
       - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
       - QDRANT_VECTOR_SIZE=${QDRANT_VECTOR_SIZE:-384}
       - QDRANT_DISTANCE=${QDRANT_DISTANCE:-Cosine}
       - SENTENCE_TRANSFORMERS_HOME=/app/st_cache
+
       - DB_URL=${DB_URL:-postgresql://rag:rag@postgres:5432/rag}
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/ticket-webhook}
       - NAUMEN_API_URL=${NAUMEN_API_URL:-https://naumen.example/api/tickets}
-      # --- PROXY (исправлено!) ---
+
+      # --- PROXY ---
       - http_proxy=http://proxy-ws.cbank.kz:8080
       - https_proxy=http://proxy-ws.cbank.kz:8080
       - HTTP_PROXY=http://proxy-ws.cbank.kz:8080
       - HTTPS_PROXY=http://proxy-ws.cbank.kz:8080
-
-      # КРИТИЧНО: отключаем proxy для docker-сети
       - no_proxy=localhost,127.0.0.1,::1,n8n,api,qdrant,ollama,postgres,172.18.0.0/16
       - NO_PROXY=localhost,127.0.0.1,::1,n8n,api,qdrant,ollama,postgres,172.18.0.0/16
     depends_on:
@@ -58,22 +60,12 @@ services:
       - postgres
     restart: unless-stopped
     volumes:
-      - /opt/RGA-SD/data:/app/data
+      - /opt/prod_rag/data:/app/data
       - ./models:/app/models:ro
-      - ./local_model:/app/model_data:ro
+      - ./local_model/user2-small:/app/model_data:ro
       - st_cache:/app/st_cache
     networks:
       - app_net
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz').read(); print('ok')\" || exit 1"
-        ]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -99,10 +91,14 @@ services:
     restart: always
     ports:
       - "11434:11434"
+    environment:
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_KEEP_ALIVE=5m
     volumes:
       - ollama_data:/root/.ollama
-      - ./model.gguf:/root/model.gguf
-      - ./Modelfile:/root/Modelfile
+      # ВАЖНО: монтируем твой gguf как /root/model.gguf
+      - ./models/Qwen3-14B.Q4_K_M.gguf:/root/model.gguf:ro
+      - ./Modelfile:/root/Modelfile:ro
     networks:
       - app_net
 
