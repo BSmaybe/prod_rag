@@ -21,13 +21,34 @@
         }
       },
       {
+        "id": "if-event-type",
+        "name": "IF Event Type",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          220,
+          0
+        ],
+        "parameters": {
+          "conditions": {
+            "string": [
+              {
+                "value1": "={{$json[\"event_type\"]}}",
+                "operation": "equal",
+                "value2": "ticket_result"
+              }
+            ]
+          }
+        }
+      },
+      {
         "id": "if-closed",
         "name": "IF Closed",
         "type": "n8n-nodes-base.if",
         "typeVersion": 2,
         "position": [
-          240,
-          0
+          460,
+          140
         ],
         "parameters": {
           "conditions": {
@@ -46,8 +67,8 @@
         "type": "n8n-nodes-base.noOp",
         "typeVersion": 1,
         "position": [
-          480,
-          -120
+          700,
+          20
         ]
       },
       {
@@ -56,8 +77,8 @@
         "type": "n8n-nodes-base.httpRequest",
         "typeVersion": 4,
         "position": [
-          480,
-          120
+          700,
+          260
         ],
         "parameters": {
           "authentication": "none",
@@ -73,13 +94,23 @@
         }
       },
       {
+        "id": "noop-queued",
+        "name": "Stop queued",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          940,
+          260
+        ]
+      },
+      {
         "id": "send-naumen",
         "name": "Send comment to Naumen",
         "type": "n8n-nodes-base.httpRequest",
         "typeVersion": 4,
         "position": [
-          720,
-          120
+          460,
+          -160
         ],
         "parameters": {
           "authentication": "predefinedCredentialType",
@@ -104,6 +135,24 @@
     "connections": {
       "Webhook": {
         "main": [
+          [
+            {
+              "node": "IF Event Type",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Event Type": {
+        "main": [
+          [
+            {
+              "node": "Send comment to Naumen",
+              "type": "main",
+              "index": 0
+            }
+          ],
           [
             {
               "node": "IF Closed",
@@ -135,7 +184,7 @@
         "main": [
           [
             {
-              "node": "Send comment to Naumen",
+              "node": "Stop queued",
               "type": "main",
               "index": 0
             }

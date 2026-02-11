@@ -18,11 +18,17 @@ from pydantic import BaseModel
 
 from api.db import (
     claim_outbox_batch,
+    claim_ticket_jobs_batch,
     db_conn,
+    enqueue_outbox_event,
+    enqueue_ticket_job,
     ensure_schema,
+    get_ticket_job,
     mark_outbox_dead,
     mark_outbox_retry,
     mark_outbox_sent,
+    mark_ticket_job_done,
+    mark_ticket_job_error,
     set_ticket_status,
 )
 from api.manage import router as manage_router
@@ -68,10 +74,14 @@ OUTBOX_POLL_SEC = float(os.getenv("OUTBOX_POLL_SEC", "2"))
 OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
 OUTBOX_MAX_ATTEMPTS = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "8"))
 OUTBOX_BACKOFF_BASE_SEC = int(os.getenv("OUTBOX_BACKOFF_BASE_SEC", "5"))
+JOB_POLL_SEC = float(os.getenv("JOB_POLL_SEC", "1"))
+JOB_BATCH_SIZE = int(os.getenv("JOB_BATCH_SIZE", "20"))
+PROCESS_TICKET_ASYNC = (os.getenv("PROCESS_TICKET_ASYNC", "true").lower() in {"1", "true", "yes", "on"})
 
 N8N_WEBHOOK_URL = (os.getenv("N8N_WEBHOOK_URL") or "").strip()
 
 outbox_worker_task: asyncio.Task[None] | None = None
+ticket_job_worker_task: asyncio.Task[None] | None = None
 
 
 def _next_retry_at(attempts: int) -> datetime:
@@ -118,6 +128,52 @@ def _mark_dead_sync(outbox_id: int, last_error: str) -> None:
         mark_outbox_dead(conn, outbox_id=outbox_id, last_error=last_error)
 
 
+def _enqueue_ticket_job_sync(ticket_id: str, text_anonymized: str) -> str:
+    with db_conn() as conn:
+        return enqueue_ticket_job(conn, ticket_id=ticket_id, text_anonymized=text_anonymized)
+
+
+def _claim_ticket_jobs_batch_sync(limit: int) -> list[dict[str, Any]]:
+    with db_conn() as conn:
+        return claim_ticket_jobs_batch(conn, limit=limit)
+
+
+def _mark_ticket_job_done_and_enqueue_result_sync(
+    job_id: str,
+    ticket_id: str,
+    result_payload: dict[str, Any],
+) -> int:
+    with db_conn() as conn:
+        mark_ticket_job_done(conn, job_id=job_id, result_payload=result_payload, autocommit=False)
+        outbox_id = enqueue_outbox_event(
+            conn,
+            ticket_id=ticket_id,
+            payload={
+                "event_type": "ticket_result",
+                "job_id": job_id,
+                "ticket_id": ticket_id,
+                "status": result_payload.get("status", "error"),
+                "comment": result_payload.get("comment", ""),
+                "used_issue_keys": result_payload.get("used_issue_keys", []),
+                "top1_score": float(result_payload.get("top1_score", 0.0) or 0.0),
+                "used_chunks": result_payload.get("used_chunks", []),
+            },
+            autocommit=False,
+        )
+        conn.commit()
+        return outbox_id
+
+
+def _mark_ticket_job_error_sync(job_id: str, error: str) -> None:
+    with db_conn() as conn:
+        mark_ticket_job_error(conn, job_id=job_id, error=error)
+
+
+def _get_ticket_job_sync(job_id: str) -> dict[str, Any] | None:
+    with db_conn() as conn:
+        return get_ticket_job(conn, job_id)
+
+
 async def _outbox_worker_loop() -> None:
     log.info(
         "outbox_worker_started poll_sec=%s batch_size=%s max_attempts=%s",
@@ -137,17 +193,27 @@ async def _outbox_worker_loop() -> None:
                 ticket_id = str(item.get("ticket_id") or "")
                 payload = item.get("payload") or {}
                 attempts = int(item.get("attempts") or 0)
+                created_at = item.get("created_at")
+                queue_wait_ms = -1.0
+                if isinstance(created_at, datetime):
+                    queue_wait_ms = (
+                        datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)
+                    ).total_seconds() * 1000.0
                 try:
                     if not isinstance(payload, dict):
                         raise RuntimeError("outbox payload must be JSON object")
 
+                    t_deliver = time.perf_counter()
                     await _send_outbox_payload(payload)
+                    deliver_ms = (time.perf_counter() - t_deliver) * 1000.0
                     await asyncio.to_thread(_mark_sent_sync, outbox_id)
                     log.info(
-                        "outbox_sent outbox_id=%s ticket_id=%s attempts=%s",
+                        "outbox_sent outbox_id=%s ticket_id=%s attempts=%s queue_wait_ms=%.1f deliver_ms=%.1f",
                         outbox_id,
                         ticket_id,
                         attempts,
+                        queue_wait_ms,
+                        deliver_ms,
                     )
                 except Exception as e:
                     next_attempts = attempts + 1
@@ -161,7 +227,7 @@ async def _outbox_worker_loop() -> None:
                             e,
                         )
                     else:
-                        next_retry = _next_retry_at(attempts)
+                        next_retry = _next_retry_at(next_attempts)
                         await asyncio.to_thread(
                             _mark_retry_sync,
                             outbox_id,
@@ -197,6 +263,204 @@ def _clarification_template() -> str:
     )
 
 
+def _run_ticket_reasoning(
+    *,
+    ticket_id: str,
+    clean_text: str,
+    trace_id: str = "-",
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    total_start = time.perf_counter()
+    retrieval_ms = 0.0
+    llm_ms = 0.0
+    format_ms = 0.0
+
+    try:
+        top_k = int(os.getenv("PROCESS_TOP_K", "5"))
+
+        t_retrieval = time.perf_counter()
+        hits = search_hits(clean_text, top_k=top_k) or []
+        used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
+        top1_score = float(scores[0]) if scores else 0.0
+        context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
+        if not context_chunks_nonempty:
+            top1_score = 0.0
+        retrieval_ms = (time.perf_counter() - t_retrieval) * 1000.0
+
+        if len(hits) < NO_CONTEXT_MIN_HITS or top1_score < NO_CONTEXT_SCORE_THRESHOLD:
+            comment = _clarification_template()
+            try:
+                with db_conn() as conn:
+                    set_ticket_status(conn, ticket_id=ticket_id, status="no_context")
+            except Exception as e:
+                log.warning(
+                    "process_ticket_status_update_failed ticket_id=%s error=%s",
+                    ticket_id,
+                    e,
+                )
+
+            total_ms = (time.perf_counter() - total_start) * 1000.0
+            return {
+                "ticket_id": ticket_id,
+                "status": "no_context",
+                "comment": comment,
+                "used_issue_keys": used_issue_keys,
+                "top1_score": top1_score,
+                "used_chunks": used_snippets,
+                "used_context_len": len(hits),
+                "original_text": clean_text,
+                "retrieval_ms": retrieval_ms,
+                "llm_ms": llm_ms,
+                "format_ms": format_ms,
+                "total_ms": total_ms,
+            }
+
+        context = "\n\n---\n\n".join(context_chunks_nonempty)
+
+        t_llm = time.perf_counter()
+        raw_answer = generate_answer(
+            context=context,
+            question=clean_text,
+            trace_id=trace_id,
+            job_id=job_id,
+        )
+        llm_ms = (time.perf_counter() - t_llm) * 1000.0
+
+        if not raw_answer.strip():
+            raise RuntimeError("LLM response is empty")
+
+        t_format = time.perf_counter()
+        structured_response: dict[str, Any] = to_structured(raw_answer)
+
+        if callable(postprocess):
+            try:
+                structured_response = postprocess(
+                    structured_response, query=clean_text, context=context
+                )  # type: ignore
+            except TypeError:
+                try:
+                    structured_response = postprocess(structured_response)  # type: ignore
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        format_ms = (time.perf_counter() - t_format) * 1000.0
+
+        comment = structured_response.get("full_text", raw_answer)
+
+        try:
+            with db_conn() as conn:
+                set_ticket_status(conn, ticket_id=ticket_id, status="processed")
+        except Exception as e:
+            log.warning(
+                "process_ticket_status_update_failed ticket_id=%s error=%s",
+                ticket_id,
+                e,
+            )
+
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+        return {
+            "ticket_id": ticket_id,
+            "status": "ok",
+            "comment": comment,
+            "used_issue_keys": used_issue_keys,
+            "top1_score": top1_score,
+            "original_text": clean_text,
+            "rag_response": structured_response,
+            "used_context_len": len(hits),
+            "used_chunks": used_snippets,
+            "retrieval_ms": retrieval_ms,
+            "llm_ms": llm_ms,
+            "format_ms": format_ms,
+            "total_ms": total_ms,
+        }
+    except Exception:
+        try:
+            with db_conn() as conn:
+                set_ticket_status(conn, ticket_id=ticket_id, status="error")
+        except Exception as e:
+            log.warning(
+                "process_ticket_error_status_failed ticket_id=%s error=%s",
+                ticket_id,
+                e,
+            )
+        raise
+
+
+async def _ticket_job_worker_loop() -> None:
+    log.info(
+        "ticket_job_worker_started poll_sec=%s batch_size=%s",
+        JOB_POLL_SEC,
+        JOB_BATCH_SIZE,
+    )
+    while True:
+        try:
+            batch = await asyncio.to_thread(_claim_ticket_jobs_batch_sync, JOB_BATCH_SIZE)
+            if not batch:
+                await asyncio.sleep(JOB_POLL_SEC)
+                continue
+
+            for item in batch:
+                job_id = str(item.get("job_id") or "")
+                ticket_id = str(item.get("ticket_id") or "")
+                clean_text = str(item.get("text_anonymized") or "")
+                created_at = item.get("created_at")
+                started_at = item.get("started_at")
+                queue_wait_ms = -1.0
+                if isinstance(created_at, datetime) and isinstance(started_at, datetime):
+                    queue_wait_ms = (
+                        started_at.astimezone(timezone.utc)
+                        - created_at.astimezone(timezone.utc)
+                    ).total_seconds() * 1000.0
+
+                t_total = time.perf_counter()
+                try:
+                    result = await asyncio.to_thread(
+                        _run_ticket_reasoning,
+                        ticket_id=ticket_id,
+                        clean_text=clean_text,
+                        trace_id=f"job:{job_id}",
+                        job_id=job_id,
+                    )
+                    outbox_id = await asyncio.to_thread(
+                        _mark_ticket_job_done_and_enqueue_result_sync,
+                        job_id,
+                        ticket_id,
+                        result,
+                    )
+                    total_ms = (time.perf_counter() - t_total) * 1000.0
+                    log.info(
+                        "process_job_timing job_id=%s ticket_id=%s status=%s queue_wait_ms=%.1f "
+                        "retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f total_ms=%.1f outbox_id=%s",
+                        job_id,
+                        ticket_id,
+                        result.get("status", "error"),
+                        queue_wait_ms,
+                        float(result.get("retrieval_ms", 0.0) or 0.0),
+                        float(result.get("llm_ms", 0.0) or 0.0),
+                        float(result.get("format_ms", 0.0) or 0.0),
+                        total_ms,
+                        outbox_id,
+                    )
+                except Exception as e:
+                    total_ms = (time.perf_counter() - t_total) * 1000.0
+                    await asyncio.to_thread(_mark_ticket_job_error_sync, job_id, str(e))
+                    log.exception(
+                        "process_job_failed job_id=%s ticket_id=%s queue_wait_ms=%.1f total_ms=%.1f error=%s",
+                        job_id,
+                        ticket_id,
+                        queue_wait_ms,
+                        total_ms,
+                        e,
+                    )
+        except asyncio.CancelledError:
+            log.info("ticket_job_worker_stopped")
+            raise
+        except Exception as e:
+            log.exception("ticket_job_worker_error error=%s", e)
+            await asyncio.sleep(JOB_POLL_SEC)
+
+
 @app.on_event("startup")
 def startup_init() -> None:
     try:
@@ -216,9 +480,18 @@ async def startup_outbox_worker() -> None:
         )
 
 
+@app.on_event("startup")
+async def startup_ticket_job_worker() -> None:
+    global ticket_job_worker_task
+    if ticket_job_worker_task is None or ticket_job_worker_task.done():
+        ticket_job_worker_task = asyncio.create_task(
+            _ticket_job_worker_loop(), name="ticket-job-worker"
+        )
+
+
 @app.on_event("shutdown")
 async def shutdown_outbox_worker() -> None:
-    global outbox_worker_task
+    global outbox_worker_task, ticket_job_worker_task
     if outbox_worker_task is not None and not outbox_worker_task.done():
         outbox_worker_task.cancel()
         try:
@@ -226,6 +499,13 @@ async def shutdown_outbox_worker() -> None:
         except asyncio.CancelledError:
             pass
     outbox_worker_task = None
+    if ticket_job_worker_task is not None and not ticket_job_worker_task.done():
+        ticket_job_worker_task.cancel()
+        try:
+            await ticket_job_worker_task
+        except asyncio.CancelledError:
+            pass
+    ticket_job_worker_task = None
 
 
 @app.middleware("http")
@@ -422,7 +702,11 @@ def ask(
 
     # 2) Генерация LLM через Ollama
     try:
-        raw_answer = generate_answer(context=context, question=issue_text)
+        raw_answer = generate_answer(
+            context=context,
+            question=issue_text,
+            trace_id=getattr(request.state, "request_id", "-"),
+        )
         if not raw_answer.strip():
             raise RuntimeError("LLM response is empty")
     except Exception as e:
@@ -492,107 +776,67 @@ async def process_ticket(
     if not clean_text:
         raise HTTPException(status_code=400, detail="text must not be empty")
 
-    top_k = int(os.getenv("PROCESS_TOP_K", "5"))
-    hits = search_hits(clean_text, top_k=top_k) or []
+    request_id = getattr(http_request.state, "request_id", "-")
 
-    used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
-    top1_score = float(scores[0]) if scores else 0.0
+    if PROCESS_TICKET_ASYNC:
+        job_id = await asyncio.to_thread(
+            _enqueue_ticket_job_sync,
+            request.ticket_id,
+            clean_text,
+        )
+        log.info(
+            "process_ticket_accepted request_id=%s ticket_id=%s job_id=%s async=%s",
+            request_id,
+            request.ticket_id,
+            job_id,
+            PROCESS_TICKET_ASYNC,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "ticket_id": request.ticket_id,
+                "job_id": job_id,
+            },
+        )
 
-    # Если контексты пустые — считаем что контекста нет
-    context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
-    if not context_chunks_nonempty:
-        top1_score = 0.0
-
-    if len(hits) < NO_CONTEXT_MIN_HITS or top1_score < NO_CONTEXT_SCORE_THRESHOLD:
-        comment = _clarification_template()
-        try:
-            with db_conn() as conn:
-                set_ticket_status(conn, ticket_id=request.ticket_id, status="no_context")
-        except Exception as e:
-            log.warning(
-                "process_ticket_status_update_failed ticket_id=%s error=%s",
-                request.ticket_id,
-                e,
-            )
-        if http_request is not None:
-            log.info(
-                "process_ticket request_id=%s ticket_id=%s status=no_context hits=%s top1_score=%.4f",
-                getattr(http_request.state, "request_id", "-"),
-                request.ticket_id,
-                len(hits),
-                top1_score,
-            )
-        return {
-            "ticket_id": request.ticket_id,
-            "status": "no_context",
-            "comment": comment,
-            "used_issue_keys": used_issue_keys,
-            "top1_score": top1_score,
-            "used_chunks": used_snippets,
-        }
-
-    context = "\n\n---\n\n".join(context_chunks_nonempty)
-
-    # Генерация
-    raw_answer = generate_answer(context=context, question=clean_text)
-    if not raw_answer.strip():
-        try:
-            with db_conn() as conn:
-                set_ticket_status(conn, ticket_id=request.ticket_id, status="error")
-        except Exception as e:
-            log.warning(
-                "process_ticket_error_status_failed ticket_id=%s error=%s",
-                request.ticket_id,
-                e,
-            )
-        raise HTTPException(status_code=502, detail="LLM response is empty")
-
-    structured_response: dict[str, Any] = to_structured(raw_answer)
-
-    if callable(postprocess):
-        try:
-            structured_response = postprocess(structured_response, query=clean_text, context=context)  # type: ignore
-        except TypeError:
-            try:
-                structured_response = postprocess(structured_response)  # type: ignore
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    comment = structured_response.get("full_text", raw_answer)
-
+    started = time.perf_counter()
     try:
-        with db_conn() as conn:
-            set_ticket_status(conn, ticket_id=request.ticket_id, status="processed")
+        result = await asyncio.to_thread(
+            _run_ticket_reasoning,
+            ticket_id=request.ticket_id,
+            clean_text=clean_text,
+            trace_id=request_id,
+        )
     except Exception as e:
-        log.warning(
-            "process_ticket_status_update_failed ticket_id=%s error=%s",
+        log.exception(
+            "process_ticket_failed request_id=%s ticket_id=%s error=%s",
+            request_id,
             request.ticket_id,
             e,
         )
+        raise HTTPException(status_code=502, detail=str(e))
 
-    if http_request is not None:
-        log.info(
-            "process_ticket request_id=%s ticket_id=%s status=ok text_len=%s hits=%s top1_score=%.4f",
-            getattr(http_request.state, "request_id", "-"),
-            request.ticket_id,
-            len(clean_text),
-            len(hits),
-            top1_score,
-        )
+    total_ms = (time.perf_counter() - started) * 1000.0
+    log.info(
+        "process_ticket_timing request_id=%s ticket_id=%s status=%s retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f total_ms=%.1f",
+        request_id,
+        request.ticket_id,
+        result.get("status", "error"),
+        float(result.get("retrieval_ms", 0.0) or 0.0),
+        float(result.get("llm_ms", 0.0) or 0.0),
+        float(result.get("format_ms", 0.0) or 0.0),
+        total_ms,
+    )
+    return result
 
-    return {
-        "ticket_id": request.ticket_id,
-        "status": "ok",
-        "comment": comment,
-        "used_issue_keys": used_issue_keys,
-        "top1_score": top1_score,
-        "original_text": clean_text,
-        "rag_response": structured_response,
-        "used_context_len": len(hits),
-        "used_chunks": used_snippets,
-    }
+
+@app.get("/process_ticket/jobs/{job_id}")
+async def get_process_ticket_job(job_id: str):
+    job = await asyncio.to_thread(_get_ticket_job_sync, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 
 @app.get("/healthz")

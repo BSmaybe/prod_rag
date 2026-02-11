@@ -66,7 +66,12 @@ def _safe_json(resp: requests.Response) -> dict[str, Any]:
         return {}
 
 
-def generate_answer(context: str, question: str) -> str:
+def generate_answer(
+    context: str,
+    question: str,
+    trace_id: str | None = None,
+    job_id: str | None = None,
+) -> str:
     prompt = build_prompt(context, question)
 
     payload: dict[str, Any] = {
@@ -104,10 +109,12 @@ def generate_answer(context: str, question: str) -> str:
             if resp.status_code >= 400:
                 body = _safe_json(resp)
                 log.warning(
-                    "ollama_http_error status=%s elapsed=%.1fs body_keys=%s",
+                    "ollama_http_error status=%s elapsed=%.1fs body_keys=%s trace_id=%s job_id=%s",
                     resp.status_code,
                     dt,
                     list(body.keys())[:10],
+                    trace_id or "-",
+                    job_id or "-",
                 )
                 resp.raise_for_status()
 
@@ -116,10 +123,12 @@ def generate_answer(context: str, question: str) -> str:
 
             if answer:
                 log.info(
-                    "ollama_ok elapsed=%.1fs chars=%s model=%s",
+                    "ollama_ok elapsed=%.1fs chars=%s model=%s trace_id=%s job_id=%s",
                     dt,
                     len(answer),
                     OLLAMA_MODEL,
+                    trace_id or "-",
+                    job_id or "-",
                 )
                 return answer
 
@@ -132,22 +141,32 @@ def generate_answer(context: str, question: str) -> str:
 
             # Полезный лог, чтобы видеть где именно падает
             log.warning(
-                "ollama_error attempt=%s/%s elapsed=%.1fs error=%s",
+                "ollama_error attempt=%s/%s elapsed=%.1fs error=%s trace_id=%s job_id=%s",
                 attempt,
                 OLLAMA_MAX_RETRIES,
                 dt,
                 e,
+                trace_id or "-",
+                job_id or "-",
             )
 
             if attempt < OLLAMA_MAX_RETRIES:
                 delay_sec = OLLAMA_RETRY_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
                 log.warning(
-                    "ollama_retry attempt=%s/%s delay_sec=%.1f",
+                    "ollama_retry attempt=%s/%s delay_sec=%.1f trace_id=%s job_id=%s",
                     attempt,
                     OLLAMA_MAX_RETRIES,
                     delay_sec,
+                    trace_id or "-",
+                    job_id or "-",
                 )
                 time.sleep(delay_sec)
 
-    log.error("ollama_failed attempts=%s error=%s", OLLAMA_MAX_RETRIES, last_error)
+    log.error(
+        "ollama_failed attempts=%s error=%s trace_id=%s job_id=%s",
+        OLLAMA_MAX_RETRIES,
+        last_error,
+        trace_id or "-",
+        job_id or "-",
+    )
     return ""

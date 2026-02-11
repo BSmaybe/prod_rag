@@ -446,6 +446,7 @@ def _build_n8n_payload(
     flat: Dict[str, str],
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
+        "event_type": "ticket_received",
         "ticket_id": ticket_id,
         "text": _normalize_text(text_anonymized),  # страховка от &nbsp;/\xa0
         "trace_id": trace_id,
