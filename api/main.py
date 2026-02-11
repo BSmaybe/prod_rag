@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
+
 import httpx
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,12 +25,12 @@ from api.db import (
     mark_outbox_sent,
     set_ticket_status,
 )
+from api.manage import router as manage_router
+from api.routes.servicedesk import router as servicedesk_router
+from api.utils.formatter import to_structured
 from core.llm import generate_answer
 from core.vectordb import search_hits
 from etl.anonymize import anonymize_text
-from api.utils.formatter import to_structured
-from api.manage import router as manage_router
-from api.routes.servicedesk import router as servicedesk_router
 
 
 def _load_postprocess_func():
@@ -37,7 +38,6 @@ def _load_postprocess_func():
     spec = importlib.util.find_spec("api.utils.postprocess")
     if not spec or not spec.loader:
         return None
-
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return getattr(module, "postprocess", None)
@@ -61,13 +61,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 NO_CONTEXT_SCORE_THRESHOLD = float(os.getenv("NO_CONTEXT_SCORE_THRESHOLD", "0.35"))
 NO_CONTEXT_MIN_HITS = int(os.getenv("NO_CONTEXT_MIN_HITS", "2"))
+
 OUTBOX_POLL_SEC = float(os.getenv("OUTBOX_POLL_SEC", "2"))
 OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
 OUTBOX_MAX_ATTEMPTS = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "8"))
 OUTBOX_BACKOFF_BASE_SEC = int(os.getenv("OUTBOX_BACKOFF_BASE_SEC", "5"))
+
 N8N_WEBHOOK_URL = (os.getenv("N8N_WEBHOOK_URL") or "").strip()
 
 outbox_worker_task: asyncio.Task[None] | None = None
@@ -139,6 +140,7 @@ async def _outbox_worker_loop() -> None:
                 try:
                     if not isinstance(payload, dict):
                         raise RuntimeError("outbox payload must be JSON object")
+
                     await _send_outbox_payload(payload)
                     await asyncio.to_thread(_mark_sent_sync, outbox_id)
                     log.info(
@@ -209,7 +211,9 @@ def startup_init() -> None:
 async def startup_outbox_worker() -> None:
     global outbox_worker_task
     if outbox_worker_task is None or outbox_worker_task.done():
-        outbox_worker_task = asyncio.create_task(_outbox_worker_loop(), name="n8n-outbox-worker")
+        outbox_worker_task = asyncio.create_task(
+            _outbox_worker_loop(), name="n8n-outbox-worker"
+        )
 
 
 @app.on_event("shutdown")
@@ -230,6 +234,7 @@ async def log_requests(request: Request, call_next):
     request.state.request_id = request_id
     request_ts = datetime.now(timezone.utc).isoformat()
     request.state.request_ts = request_ts
+
     start = time.perf_counter()
     response = None
     status_code = 500
@@ -264,6 +269,7 @@ async def log_requests(request: Request, call_next):
         if response is not None:
             response.headers["X-Request-ID"] = request_id
 
+
 FORM_HTML = """<form method='post' action='/ask' style="font-family:ui-sans-serif">
   <label>Текст запроса:</label><br>
   <textarea name='issue_text' rows=6 cols=80 placeholder='Опишите проблему…'></textarea><br><br>
@@ -289,12 +295,86 @@ def form_alias():
     return FORM_HTML
 
 
+def _extract_text_from_payload(payload: Any) -> str:
+    """
+    Унификация: текст мог лежать в разных ключах.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    text = (
+        payload.get("text")
+        or payload.get("issue_text")
+        or payload.get("description")
+        or payload.get("content")
+        or payload.get("body")
+        or ""
+    )
+    return str(text)
+
+
+def _hit_to_row(h: Any) -> tuple[Any, str, float]:
+    """
+    Приводим один hit к (key, text, score) с максимальною совместимостью.
+    Поддерживаем:
+      1) Новый формат (dict): {"id":..., "score":..., "payload":{...}}
+      2) Legacy tuple/list: (key, text, score) или (key, text)
+      3) Наш кастомный dict: {"issue_key":..., "text":..., "score":...}
+    """
+    # dict формат
+    if isinstance(h, dict):
+        # Qdrant-like
+        if "payload" in h or "score" in h:
+            key = h.get("id") or h.get("point_id") or h.get("issue_key")
+            score = float(h.get("score", 0.0) or 0.0)
+            payload = h.get("payload") or {}
+            text = _extract_text_from_payload(payload)
+            # если payload не содержит, попробуем прямые поля
+            if not text:
+                text = str(h.get("text") or h.get("issue_text") or "")
+            return key, text, score
+
+        # кастомный dict
+        key = h.get("issue_key") or h.get("id")
+        text = str(h.get("text") or h.get("issue_text") or h.get("content") or "")
+        score = float(h.get("score", 0.0) or 0.0)
+        return key, text, score
+
+    # legacy tuple/list
+    if isinstance(h, (tuple, list)):
+        key = h[0] if len(h) > 0 else None
+        text = str(h[1]) if len(h) > 1 and h[1] is not None else ""
+        score = float(h[2]) if len(h) > 2 and h[2] is not None else 0.0
+        return key, text, score
+
+    return None, "", 0.0
+
+
+def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], list[float]]:
+    """
+    На вход: list[Any] (любой формат search_hits)
+    На выход: used_ids, snippets, chunks, scores
+    """
+    used_ids: list[Any] = []
+    snippets: list[str] = []
+    chunks: list[str] = []
+    scores: list[float] = []
+
+    for h in hits or []:
+        key, text, score = _hit_to_row(h)
+        used_ids.append(key)
+        scores.append(float(score))
+        chunks.append(text or "")
+        snippets.append((text or "")[:300])
+
+    return used_ids, snippets, chunks, scores
+
+
 @app.post("/ask")
 def ask(
     request: Request,
     issue_text: str = Form(...),
     context_count: int = Form(20),
-    service: str | None = Form(None),
+    service: str | None = Form(None),  # оставили в API, но не передаём в search_hits
 ):
     """
     1) Ищем контекст (RAG)
@@ -312,7 +392,7 @@ def ask(
     # 1) Поиск контекста в Qdrant
     try:
         top_k = max(1, min(50, int(context_count)))
-        results = search_hits(issue_text, top_k=top_k, service=service) or []
+        results = search_hits(issue_text, top_k=top_k) or []
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -325,10 +405,20 @@ def ask(
             content={"error": "no_documents", "message": "В Qdrant не найден релевантный контекст"},
         )
 
-    used_issue_keys = [r[0] for r in results]
-    used_snippets = [str(r[1])[:300] for r in results]
-    context_chunks = [str(r[1]) for r in results]
-    context = "\n\n---\n\n".join(context_chunks)
+    used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(results)
+
+    # (опц.) можно отфильтровать пустые чанки (если payload текст не достался)
+    context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
+    if not context_chunks_nonempty:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "context_parse_failed",
+                "message": "Контекст найден, но не удалось извлечь текст из hits (payload). Проверь ключи payload при upsert.",
+            },
+        )
+
+    context = "\n\n---\n\n".join(context_chunks_nonempty)
 
     # 2) Генерация LLM через Ollama
     try:
@@ -364,16 +454,16 @@ def ask(
             except Exception:
                 pass
         except Exception:
-            # не ломаем ответ, если постпроцессор дал сбой
             pass
 
     if request is not None:
         log.info(
-            "ask request_id=%s query_len=%s top_k=%s hits=%s",
+            "ask request_id=%s query_len=%s top_k=%s hits=%s top1_score=%.4f",
             getattr(request.state, "request_id", "-"),
             len(issue_text),
             top_k,
             len(results),
+            float(scores[0]) if scores else 0.0,
         )
 
     # 5) Ответ
@@ -388,6 +478,7 @@ def ask(
             "full_text": structured.get("full_text", raw_answer),
             "used_chunks": used_snippets,
             "used_issue_keys": used_issue_keys,
+            "top1_score": float(scores[0]) if scores else 0.0,
         }
     )
 
@@ -403,8 +494,14 @@ async def process_ticket(
 
     top_k = int(os.getenv("PROCESS_TOP_K", "5"))
     hits = search_hits(clean_text, top_k=top_k) or []
-    top1_score = float(hits[0][2]) if hits else 0.0
-    used_issue_keys = [h[0] for h in hits]
+
+    used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
+    top1_score = float(scores[0]) if scores else 0.0
+
+    # Если контексты пустые — считаем что контекста нет
+    context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
+    if not context_chunks_nonempty:
+        top1_score = 0.0
 
     if len(hits) < NO_CONTEXT_MIN_HITS or top1_score < NO_CONTEXT_SCORE_THRESHOLD:
         comment = _clarification_template()
@@ -412,7 +509,11 @@ async def process_ticket(
             with db_conn() as conn:
                 set_ticket_status(conn, ticket_id=request.ticket_id, status="no_context")
         except Exception as e:
-            log.warning("process_ticket_status_update_failed ticket_id=%s error=%s", request.ticket_id, e)
+            log.warning(
+                "process_ticket_status_update_failed ticket_id=%s error=%s",
+                request.ticket_id,
+                e,
+            )
         if http_request is not None:
             log.info(
                 "process_ticket request_id=%s ticket_id=%s status=no_context hits=%s top1_score=%.4f",
@@ -427,16 +528,23 @@ async def process_ticket(
             "comment": comment,
             "used_issue_keys": used_issue_keys,
             "top1_score": top1_score,
+            "used_chunks": used_snippets,
         }
 
-    context = "\n\n---\n\n".join([str(h[1]) for h in hits])
-    raw_answer = generate_answer(context, clean_text)
+    context = "\n\n---\n\n".join(context_chunks_nonempty)
+
+    # Генерация
+    raw_answer = generate_answer(context=context, question=clean_text)
     if not raw_answer.strip():
         try:
             with db_conn() as conn:
                 set_ticket_status(conn, ticket_id=request.ticket_id, status="error")
         except Exception as e:
-            log.warning("process_ticket_error_status_failed ticket_id=%s error=%s", request.ticket_id, e)
+            log.warning(
+                "process_ticket_error_status_failed ticket_id=%s error=%s",
+                request.ticket_id,
+                e,
+            )
         raise HTTPException(status_code=502, detail="LLM response is empty")
 
     structured_response: dict[str, Any] = to_structured(raw_answer)
@@ -453,11 +561,16 @@ async def process_ticket(
             pass
 
     comment = structured_response.get("full_text", raw_answer)
+
     try:
         with db_conn() as conn:
             set_ticket_status(conn, ticket_id=request.ticket_id, status="processed")
     except Exception as e:
-        log.warning("process_ticket_status_update_failed ticket_id=%s error=%s", request.ticket_id, e)
+        log.warning(
+            "process_ticket_status_update_failed ticket_id=%s error=%s",
+            request.ticket_id,
+            e,
+        )
 
     if http_request is not None:
         log.info(
@@ -478,6 +591,7 @@ async def process_ticket(
         "original_text": clean_text,
         "rag_response": structured_response,
         "used_context_len": len(hits),
+        "used_chunks": used_snippets,
     }
 
 

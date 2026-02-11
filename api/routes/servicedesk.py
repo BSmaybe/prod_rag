@@ -554,8 +554,14 @@ async def ingest_from_sd(request: Request):
                             ),
                             autocommit=False,
                         )
-                        outbox_enqueued += 1
-                        log.info("outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s", request_id, ticket_id, outbox_id)
+                        if outbox_id:
+                            outbox_enqueued += 1
+                            log.info(
+                                "outbox_enqueued request_id=%s ticket_id=%s outbox_id=%s",
+                                request_id, ticket_id, outbox_id,
+                            )
+                        else:
+                            log.info("outbox_dedup_skip request_id=%s ticket_id=%s", request_id, ticket_id)
 
                     conn.commit()
                     accepted += 1

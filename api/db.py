@@ -55,11 +55,27 @@ def db_conn() -> Generator[psycopg.Connection, None, None]:
 
 def _payload_hash(payload: dict[str, Any]) -> str:
     """
-    Делаем стабильный sha256 от payload (json canonical).
-    Используем для дедупа outbox.
+    Стабильный хэш для дедупа.
+    ВАЖНО: исключаем trace_id и любые "плавающие" поля, чтобы дубль не создавал новую запись.
     """
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+
+    normalized = dict(payload)
+
+    # trace_id меняется каждый раз — выкидываем из хэша
+    normalized.pop("trace_id", None)
+
+    # иногда ещё может гулять request_id и т.п. — если добавишь в payload, тоже выкидывай тут
+    normalized.pop("request_id", None)
+
+    s = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(s).hexdigest()
 
 
 def ensure_schema(conn: psycopg.Connection) -> None:
@@ -91,14 +107,13 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             """
         )
 
-        # outbox
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS n8n_outbox (
                 id bigserial PRIMARY KEY,
                 ticket_id text NOT NULL,
                 payload jsonb NOT NULL,
-                payload_hash text NOT NULL DEFAULT '',
+                payload_hash text NULL,
                 status text NOT NULL DEFAULT 'pending',
                 attempts int NOT NULL DEFAULT 0,
                 next_retry_at timestamptz NOT NULL DEFAULT now(),
@@ -109,13 +124,9 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             """
         )
 
-        # миграции для существующей таблицы
+        # если таблица существовала раньше без payload_hash — добавим
         cur.execute("ALTER TABLE n8n_outbox ADD COLUMN IF NOT EXISTS payload_hash text;")
-        cur.execute("UPDATE n8n_outbox SET payload_hash = '' WHERE payload_hash IS NULL;")
-        cur.execute("ALTER TABLE n8n_outbox ALTER COLUMN payload_hash SET DEFAULT '';")
-        cur.execute("ALTER TABLE n8n_outbox ALTER COLUMN payload_hash SET NOT NULL;")
 
-        # индекс для обработки
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_n8n_outbox_status_next_retry
@@ -129,10 +140,10 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             """
         )
 
-        # ЖЁСТКИЙ дедуп: один и тот же payload на один ticket — только 1 раз
+        # ДЕДУП: один и тот же payload_hash для ticket_id может быть только один раз
         cur.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_n8n_outbox_ticket_payloadhash
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_n8n_outbox_ticket_payload_hash
             ON n8n_outbox(ticket_id, payload_hash);
             """
         )
@@ -211,13 +222,14 @@ def enqueue_outbox_event(
     autocommit: bool = True,
 ) -> int:
     """
-    Кладём событие в outbox.
-    Дедупаем на уровне БД по (ticket_id, payload_hash).
-    Если дубль — вернём id уже существующей записи.
+    Идемпотентная вставка: если такой же payload_hash уже был — не вставляем второй раз.
+    Возвращает:
+      - id новой записи, если вставили
+      - 0, если это дубль (уже есть)
     """
     ph = _payload_hash(payload)
-    payload_json = json.dumps(payload, ensure_ascii=False)
 
+    outbox_id = 0
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -226,27 +238,14 @@ def enqueue_outbox_event(
             ON CONFLICT (ticket_id, payload_hash) DO NOTHING
             RETURNING id;
             """,
-            (ticket_id, payload_json, ph, status),
+            (ticket_id, json.dumps(payload, ensure_ascii=False), ph, status),
         )
         row = cur.fetchone()
-        if row:
-            outbox_id = int(row[0])
-        else:
-            # уже существовало — достанем id
-            cur.execute(
-                """
-                SELECT id FROM n8n_outbox
-                WHERE ticket_id = %s AND payload_hash = %s
-                ORDER BY id DESC
-                LIMIT 1;
-                """,
-                (ticket_id, ph),
-            )
-            row2 = cur.fetchone()
-            outbox_id = int(row2[0]) if row2 else 0
+        outbox_id = int(row[0]) if row else 0
 
     if autocommit:
         conn.commit()
+
     return outbox_id
 
 
