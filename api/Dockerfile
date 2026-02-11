@@ -11,11 +11,6 @@ ENV no_proxy=${no_proxy}
 
 WORKDIR /app
 
-# нужно для llama-cpp-python, если будет сборка из исходников
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git \
-    && rm -rf /var/lib/apt/lists/*
-
 # 1) Ставим Python-зависимости
 COPY api/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
@@ -23,7 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 2) Копируем код по папкам
 COPY api /app/api
 COPY retriever /app/retriever
-COPY llm /app/llm
 COPY utils /app/utils
 COPY core /app/core
 COPY etl /app/etl

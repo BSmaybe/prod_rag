@@ -1,5 +1,4 @@
-[
-  {
+{
     "id": "1",
     "name": "Naumen Ticket Processing",
     "active": false,
@@ -196,5 +195,4 @@
       "saveExecutionProgress": true,
       "saveManualExecutions": true
     }
-  }
-]
+}

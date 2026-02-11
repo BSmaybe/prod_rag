@@ -8,15 +8,11 @@ uvicorn[standard]>=0.30.6
 numpy==1.26.4
 requests
 httpx
-jinja2
 python-dotenv
 python-multipart
-openpyxl
-scikit-learn>=1.5.2
 
-# --- Postgres (pgvector) ---
+# --- Postgres ---
 psycopg[binary]
-pgvector
 
 # --- Vector Database (Qdrant) ---
 qdrant-client>=1.7.0
@@ -28,8 +24,3 @@ torch>=2.4.1
 transformers>=4.44.2
 safetensors>=0.4.5
 tokenizers>=0.19.1
-optimum>=1.20.0
-onnxruntime>=1.18.0
-
-# --- llama.cpp backend (GGUF local) ---
-llama-cpp-python==0.3.7
