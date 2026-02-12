@@ -1,11 +1,12 @@
-FROM /root/model.gguf
+FROM /models/qwen2.5-3b-instruct-q5_k_m.gguf
 
 PARAMETER temperature 0.2
 PARAMETER top_p 0.9
 PARAMETER num_ctx 4096
+PARAMETER num_predict 256
 
 SYSTEM """
-Ты помощник инженера Service Desk банка. Отвечай структурировано:
+Ты помощник инженера Service Desk банка. Отвечай структурировано и кратко на русском языке:
 1) Краткий диагноз
 2) Гипотезы (3-7)
 3) Что проверить (логи/метрики/БД)

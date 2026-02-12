@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Dict
 
 import requests
 
@@ -15,12 +15,12 @@ log = logging.getLogger("rag.llm")
 OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "4"))
 OLLAMA_RETRY_BACKOFF_BASE_SEC = float(os.getenv("OLLAMA_RETRY_BACKOFF_BASE_SEC", "2"))
 
-# ВАЖНО: это будет READ timeout (сколько ждём генерацию), а connect сделаем отдельно ниже
+# READ timeout (ждём генерацию) + connect отдельно
 OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "900"))
 OLLAMA_CONNECT_TIMEOUT_SEC = float(os.getenv("OLLAMA_CONNECT_TIMEOUT_SEC", "10"))
 
-# Ограничение длины ответа (сильно влияет на скорость)
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "500"))
+# Ограничение длины ответа
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "160"))
 
 # Контекст
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
@@ -31,7 +31,6 @@ OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
 
 
 def build_prompt(context: str, question: str) -> str:
-    # Этот промпт взят из RGA-SD (llm/generator.py), он проверен боем
     return f"""Ты — инженер технической поддержки банка (1-я линия).
 Твоя задача — дать практичные действия по новому обращению на основе истории похожих кейсов.
 
@@ -59,11 +58,19 @@ def build_prompt(context: str, question: str) -> str:
 """
 
 
-def _safe_json(resp: requests.Response) -> dict[str, Any]:
+def _safe_json(resp: requests.Response) -> Dict[str, Any]:
     try:
         return resp.json() if resp.content else {}
     except Exception:
         return {}
+
+
+def _ns_to_ms(v: Any) -> float:
+    try:
+        # ollama отдаёт duration в наносекундах
+        return float(v) / 1_000_000.0
+    except Exception:
+        return 0.0
 
 
 def generate_answer(
@@ -82,23 +89,17 @@ def generate_answer(
             "temperature": OLLAMA_TEMPERATURE,
             "top_p": OLLAMA_TOP_P,
             "num_ctx": OLLAMA_NUM_CTX,
-            # КЛЮЧЕВОЕ: ограничиваем длину генерации, иначе будет очень долго
             "num_predict": OLLAMA_NUM_PREDICT,
-            # Опционально: можно подсказать остановку
-            # (если мешает — убери)
-            "stop": [
-                "\n\n5)",
-                "\n\n5.",
-                "\n\nПятый",
-                "\n\nИтог",
-            ],
+            "stop": ["\n\n5)", "\n\n5.", "\n\nПятый", "\n\nИтог"],
         },
     }
 
     last_error: Exception | None = None
-
-    # connect timeout короткий, read timeout длинный (ждём генерацию)
     timeout = (OLLAMA_CONNECT_TIMEOUT_SEC, OLLAMA_TIMEOUT_SEC)
+
+    prompt_chars = len(prompt)
+    context_chars = len(context or "")
+    question_chars = len(question or "")
 
     for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
         t0 = time.time()
@@ -121,12 +122,37 @@ def generate_answer(
             data = _safe_json(resp)
             answer = str(data.get("response", "")).strip()
 
+            # ---- метрики Ollama (если есть) ----
+            total_ms = _ns_to_ms(data.get("total_duration"))
+            load_ms = _ns_to_ms(data.get("load_duration"))
+            pe_cnt = int(data.get("prompt_eval_count") or 0)
+            pe_ms = _ns_to_ms(data.get("prompt_eval_duration"))
+            ev_cnt = int(data.get("eval_count") or 0)
+            ev_ms = _ns_to_ms(data.get("eval_duration"))
+
+            tok_s = 0.0
+            if ev_ms > 0 and ev_cnt > 0:
+                tok_s = ev_cnt / (ev_ms / 1000.0)
+
             if answer:
                 log.info(
-                    "ollama_ok elapsed=%.1fs chars=%s model=%s trace_id=%s job_id=%s",
+                    "ollama_ok elapsed=%.1fs model=%s num_predict=%s "
+                    "prompt_chars=%s context_chars=%s question_chars=%s "
+                    "ollama_total_ms=%.1f load_ms=%.1f prompt_eval_cnt=%s prompt_eval_ms=%.1f "
+                    "eval_cnt=%s eval_ms=%.1f tok_s=%.2f trace_id=%s job_id=%s",
                     dt,
-                    len(answer),
                     OLLAMA_MODEL,
+                    OLLAMA_NUM_PREDICT,
+                    prompt_chars,
+                    context_chars,
+                    question_chars,
+                    total_ms,
+                    load_ms,
+                    pe_cnt,
+                    pe_ms,
+                    ev_cnt,
+                    ev_ms,
+                    tok_s,
                     trace_id or "-",
                     job_id or "-",
                 )
@@ -139,13 +165,13 @@ def generate_answer(
             dt = time.time() - t0
             last_error = e
 
-            # Полезный лог, чтобы видеть где именно падает
             log.warning(
-                "ollama_error attempt=%s/%s elapsed=%.1fs error=%s trace_id=%s job_id=%s",
+                "ollama_error attempt=%s/%s elapsed=%.1fs error=%s prompt_chars=%s trace_id=%s job_id=%s",
                 attempt,
                 OLLAMA_MAX_RETRIES,
                 dt,
                 e,
+                prompt_chars,
                 trace_id or "-",
                 job_id or "-",
             )
@@ -170,3 +196,4 @@ def generate_answer(
         job_id or "-",
     )
     return ""
+

@@ -6,6 +6,7 @@ import importlib.util
 import logging
 import os
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -82,6 +83,16 @@ N8N_WEBHOOK_URL = (os.getenv("N8N_WEBHOOK_URL") or "").strip()
 
 outbox_worker_task: asyncio.Task[None] | None = None
 ticket_job_worker_task: asyncio.Task[None] | None = None
+
+
+@contextmanager
+def _stage(timings: dict[str, float], key: str):
+    """Context manager to record stage duration into timings dict in milliseconds."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[key] = (time.perf_counter() - t0) * 1000.0
 
 
 def _next_retry_at(attempts: int) -> datetime:
@@ -278,6 +289,7 @@ def _run_ticket_reasoning(
     try:
         top_k = int(os.getenv("PROCESS_TOP_K", "5"))
 
+        # ---- retrieval
         t_retrieval = time.perf_counter()
         hits = search_hits(clean_text, top_k=top_k) or []
         used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
@@ -317,6 +329,7 @@ def _run_ticket_reasoning(
 
         context = "\n\n---\n\n".join(context_chunks_nonempty)
 
+        # ---- llm
         t_llm = time.perf_counter()
         raw_answer = generate_answer(
             context=context,
@@ -329,6 +342,7 @@ def _run_ticket_reasoning(
         if not raw_answer.strip():
             raise RuntimeError("LLM response is empty")
 
+        # ---- formatter/postprocess
         t_format = time.perf_counter()
         structured_response: dict[str, Any] = to_structured(raw_answer)
 
@@ -514,7 +528,6 @@ async def log_requests(request: Request, call_next):
     request.state.request_id = request_id
     request_ts = datetime.now(timezone.utc).isoformat()
     request.state.request_ts = request_ts
-
     start = time.perf_counter()
     response = None
     status_code = 500
@@ -594,27 +607,27 @@ def _extract_text_from_payload(payload: Any) -> str:
 
 def _hit_to_row(h: Any) -> tuple[Any, str, float]:
     """
-    Приводим один hit к (key, text, score) с максимальною совместимостью.
+    Приводим один hit к (key, text, score) с максимальной совместимостью.
+
     Поддерживаем:
-      1) Новый формат (dict): {"id":..., "score":..., "payload":{...}}
-      2) Legacy tuple/list: (key, text, score) или (key, text)
-      3) Наш кастомный dict: {"issue_key":..., "text":..., "score":...}
+      1) Qdrant-like dict: {"id"/"point_id":..., "score":..., "payload":{...}}
+      2) Наш кастом dict: {"issue_key":..., "text":..., "score":...}
+      3) Legacy tuple/list: (key, text, score) или (key, text)
     """
     # dict формат
     if isinstance(h, dict):
-        # Qdrant-like
-        if "payload" in h or "score" in h:
+        # --- Qdrant-like
+        if ("payload" in h) or ("score" in h and ("id" in h or "point_id" in h)):
             key = h.get("id") or h.get("point_id") or h.get("issue_key")
             score = float(h.get("score", 0.0) or 0.0)
             payload = h.get("payload") or {}
             text = _extract_text_from_payload(payload)
-            # если payload не содержит, попробуем прямые поля
             if not text:
-                text = str(h.get("text") or h.get("issue_text") or "")
+                text = str(h.get("text") or h.get("issue_text") or h.get("content") or "")
             return key, text, score
 
-        # кастомный dict
-        key = h.get("issue_key") or h.get("id")
+        # --- кастомный dict
+        key = h.get("issue_key") or h.get("id") or h.get("key")
         text = str(h.get("text") or h.get("issue_text") or h.get("content") or "")
         score = float(h.get("score", 0.0) or 0.0)
         return key, text, score
@@ -662,6 +675,8 @@ def ask(
     3) Превращаем «сырой» ответ в структуру (formatter)
     4) (опц.) postprocess
     5) Возвращаем предсказуемый JSON
+
+    + Разметка (timings) для понимания "где затык"
     """
     if not issue_text or not issue_text.strip():
         return JSONResponse(
@@ -669,10 +684,14 @@ def ask(
             content={"error": "empty_issue_text", "message": "issue_text не должен быть пустым"},
         )
 
+    timings: dict[str, float] = {}
+    total_t0 = time.perf_counter()
+
     # 1) Поиск контекста в Qdrant
     try:
         top_k = max(1, min(50, int(context_count)))
-        results = search_hits(issue_text, top_k=top_k) or []
+        with _stage(timings, "retrieval_ms"):
+            results = search_hits(issue_text, top_k=top_k) or []
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -680,6 +699,16 @@ def ask(
         )
 
     if not results:
+        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+        log.info(
+            "ask_timing request_id=%s query_len=%s top_k=%s hits=0 "
+            "retrieval_ms=%.1f total_ms=%.1f",
+            getattr(request.state, "request_id", "-"),
+            len(issue_text),
+            top_k,
+            float(timings.get("retrieval_ms", 0.0) or 0.0),
+            float(timings.get("total_ms", 0.0) or 0.0),
+        )
         return JSONResponse(
             status_code=404,
             content={"error": "no_documents", "message": "В Qdrant не найден релевантный контекст"},
@@ -687,9 +716,19 @@ def ask(
 
     used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(results)
 
-    # (опц.) можно отфильтровать пустые чанки (если payload текст не достался)
     context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
     if not context_chunks_nonempty:
+        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+        log.info(
+            "ask_timing request_id=%s query_len=%s top_k=%s hits=%s "
+            "retrieval_ms=%.1f stage=context_parse_failed total_ms=%.1f",
+            getattr(request.state, "request_id", "-"),
+            len(issue_text),
+            top_k,
+            len(results),
+            float(timings.get("retrieval_ms", 0.0) or 0.0),
+            float(timings.get("total_ms", 0.0) or 0.0),
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -702,14 +741,29 @@ def ask(
 
     # 2) Генерация LLM через Ollama
     try:
-        raw_answer = generate_answer(
-            context=context,
-            question=issue_text,
-            trace_id=getattr(request.state, "request_id", "-"),
-        )
+        with _stage(timings, "llm_ms"):
+            raw_answer = generate_answer(
+                context=context,
+                question=issue_text,
+                trace_id=getattr(request.state, "request_id", "-"),
+            )
         if not raw_answer.strip():
             raise RuntimeError("LLM response is empty")
     except Exception as e:
+        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+        log.info(
+            "ask_timing request_id=%s query_len=%s top_k=%s hits=%s top1_score=%.4f "
+            "retrieval_ms=%.1f llm_ms=%.1f total_ms=%.1f llm_failed=%s",
+            getattr(request.state, "request_id", "-"),
+            len(issue_text),
+            top_k,
+            len(results),
+            float(scores[0]) if scores else 0.0,
+            float(timings.get("retrieval_ms", 0.0) or 0.0),
+            float(timings.get("llm_ms", 0.0) or 0.0),
+            float(timings.get("total_ms", 0.0) or 0.0),
+            str(e),
+        )
         return JSONResponse(
             status_code=502,
             content={"error": "llm_failed", "message": f"Ошибка генерации ответа LLM: {e}"},
@@ -717,8 +771,23 @@ def ask(
 
     # 3) Форматирование → 4 секции
     try:
-        structured = to_structured(raw_answer)
+        with _stage(timings, "format_ms"):
+            structured = to_structured(raw_answer)
     except Exception as e:
+        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+        log.info(
+            "ask_timing request_id=%s query_len=%s top_k=%s hits=%s "
+            "retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f total_ms=%.1f format_failed=%s",
+            getattr(request.state, "request_id", "-"),
+            len(issue_text),
+            top_k,
+            len(results),
+            float(timings.get("retrieval_ms", 0.0) or 0.0),
+            float(timings.get("llm_ms", 0.0) or 0.0),
+            float(timings.get("format_ms", 0.0) or 0.0),
+            float(timings.get("total_ms", 0.0) or 0.0),
+            str(e),
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -731,24 +800,39 @@ def ask(
     # 4) (опционально) пост-обработка
     if callable(postprocess):
         try:
+            t0 = time.perf_counter()
             structured = postprocess(structured, query=issue_text, context=context)  # type: ignore
+            timings["postprocess_ms"] = (time.perf_counter() - t0) * 1000.0
         except TypeError:
             try:
+                t0 = time.perf_counter()
                 structured = postprocess(structured)  # type: ignore
+                timings["postprocess_ms"] = (time.perf_counter() - t0) * 1000.0
             except Exception:
                 pass
         except Exception:
             pass
 
-    if request is not None:
-        log.info(
-            "ask request_id=%s query_len=%s top_k=%s hits=%s top1_score=%.4f",
-            getattr(request.state, "request_id", "-"),
-            len(issue_text),
-            top_k,
-            len(results),
-            float(scores[0]) if scores else 0.0,
-        )
+    timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+
+    # лог метрик — ключевой
+    log.info(
+        "ask_timing request_id=%s query_len=%s top_k=%s hits=%s top1_score=%.4f "
+        "ctx_chunks=%s ctx_chars=%s "
+        "retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f postprocess_ms=%.1f total_ms=%.1f",
+        getattr(request.state, "request_id", "-"),
+        len(issue_text),
+        top_k,
+        len(results),
+        float(scores[0]) if scores else 0.0,
+        len(context_chunks_nonempty),
+        len(context),
+        float(timings.get("retrieval_ms", 0.0) or 0.0),
+        float(timings.get("llm_ms", 0.0) or 0.0),
+        float(timings.get("format_ms", 0.0) or 0.0),
+        float(timings.get("postprocess_ms", 0.0) or 0.0),
+        float(timings.get("total_ms", 0.0) or 0.0),
+    )
 
     # 5) Ответ
     return JSONResponse(
