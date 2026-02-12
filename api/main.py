@@ -595,7 +595,9 @@ def _extract_text_from_payload(payload: Any) -> str:
     if not isinstance(payload, dict):
         return ""
     text = (
-        payload.get("text")
+        payload.get("text_chunk")
+        or payload.get("problem_text")
+        or payload.get("text")
         or payload.get("issue_text")
         or payload.get("description")
         or payload.get("content")
@@ -678,7 +680,8 @@ def ask(
 
     + Разметка (timings) для понимания "где затык"
     """
-    if not issue_text or not issue_text.strip():
+    issue_text = (issue_text or "").strip()
+    if not issue_text:
         return JSONResponse(
             status_code=400,
             content={"error": "empty_issue_text", "message": "issue_text не должен быть пустым"},

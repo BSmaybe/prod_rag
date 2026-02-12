@@ -10,6 +10,7 @@ import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 from sentence_transformers import SentenceTransformer
+from etl.anonymize import anonymize_text
 
 # -----------------------
 # Logging
@@ -32,7 +33,7 @@ logger = logging.getLogger("rag.vectordb")
 # -----------------------
 QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "kb_tickets")
+QDRANT_COLLECTION = os.getenv("COLLECTION_NAME") or os.getenv("QDRANT_COLLECTION", "kb_tickets")
 
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "/app/model_data")
 EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
@@ -181,13 +182,20 @@ def _vector_payload(points: List[qm.ScoredPoint]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in points:
         payload = p.payload or {}
+        text = payload.get("text_chunk") or payload.get("problem_text") or payload.get("text") or ""
+        problem_text = payload.get("problem_text") or payload.get("text") or ""
+        solution_text = payload.get("solution_text") or ""
+        service = payload.get("service") or ""
         out.append(
             {
                 "score": float(p.score),
                 "issue_key": payload.get("issue_key"),
-                "text": payload.get("text"),
-                "solution_text": payload.get("solution_text"),
-                "service": payload.get("service"),
+                "text": str(text),
+                "problem_text": str(problem_text),
+                "solution_text": str(solution_text),
+                "service": str(service),
+                "snippet": str(payload.get("snippet") or ""),
+                "text_hash": payload.get("text_hash"),
             }
         )
     return out
@@ -209,20 +217,39 @@ def upsert_tickets(rows: List[Dict[str, str]]) -> int:
 
     for r in rows:
         issue_key = (r.get("issue_key") or "").strip()
-        text = (r.get("text") or "").strip()
-        if not issue_key or not text:
+        raw_problem_text = (r.get("text") or "").strip()
+        if not issue_key or not raw_problem_text:
             continue
 
-        idx_text = _build_index_text(r)
+        problem_text = anonymize_text(raw_problem_text)
+        solution_text = anonymize_text((r.get("solution_text") or "").strip())
+        service = anonymize_text((r.get("service") or "").strip())
+
+        idx_text = _build_index_text(
+            {
+                "service": service,
+                "text": problem_text,
+                "solution_text": solution_text,
+            }
+        )
+        if not idx_text:
+            continue
+
+        text_hash = hashlib.sha1(idx_text.encode("utf-8")).hexdigest()
         indexed_texts.append(idx_text)
         ids.append(_ticket_u64_id(issue_key))
 
         payloads.append(
             {
                 "issue_key": issue_key,
-                "text": text,
-                "solution_text": (r.get("solution_text") or "").strip(),
-                "service": (r.get("service") or "").strip(),
+                "text_chunk": idx_text,
+                "problem_text": problem_text,
+                "solution_text": solution_text,
+                # Keep legacy key for compatibility with old readers.
+                "text": idx_text,
+                "service": service,
+                "snippet": idx_text[:300],
+                "text_hash": text_hash,
             }
         )
 

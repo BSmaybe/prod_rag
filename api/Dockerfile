@@ -11,9 +11,13 @@ ENV no_proxy=${no_proxy}
 
 WORKDIR /app
 
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
 # 1) Ставим Python-зависимости
 COPY api/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefer-binary -r requirements.txt
 
 # 2) Копируем код по папкам
 COPY api /app/api
