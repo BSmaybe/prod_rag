@@ -1,198 +1,176 @@
 {
-    "id": "1",
-    "name": "Naumen Ticket Processing",
-    "active": false,
-    "nodes": [
-      {
-        "id": "webhook-ticket",
-        "name": "Webhook",
-        "type": "n8n-nodes-base.webhook",
-        "typeVersion": 1,
-        "position": [
-          0,
-          0
-        ],
-        "parameters": {
-          "httpMethod": "POST",
-          "path": "ticket-webhook",
-          "responseMode": "onReceived",
-          "responseData": "allEntries"
-        }
+  "name": "Naumen RAG Processing (Clean)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket-webhook",
+        "responseMode": "onReceived",
+        "responseData": "allEntries"
       },
-      {
-        "id": "if-event-type",
-        "name": "IF Event Type",
-        "type": "n8n-nodes-base.if",
-        "typeVersion": 2,
-        "position": [
-          220,
-          0
-        ],
-        "parameters": {
-          "conditions": {
-            "string": [
-              {
-                "value1": "={{$json[\"event_type\"]}}",
-                "operation": "equal",
-                "value2": "ticket_result"
-              }
-            ]
-          }
-        }
-      },
-      {
-        "id": "if-closed",
-        "name": "IF Closed",
-        "type": "n8n-nodes-base.if",
-        "typeVersion": 2,
-        "position": [
-          460,
-          140
-        ],
-        "parameters": {
-          "conditions": {
-            "boolean": [
-              {
-                "value1": "={{$json[\"is_closed\"]}}",
-                "operation": "isTrue"
-              }
-            ]
-          }
-        }
-      },
-      {
-        "id": "noop-closed",
-        "name": "Stop for closed",
-        "type": "n8n-nodes-base.noOp",
-        "typeVersion": 1,
-        "position": [
-          700,
-          20
-        ]
-      },
-      {
-        "id": "call-app",
-        "name": "Call /process_ticket",
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4,
-        "position": [
-          700,
-          260
-        ],
-        "parameters": {
-          "authentication": "none",
-          "method": "POST",
-          "url": "http://api:8080/process_ticket",
-          "sendBody": true,
-          "jsonParameters": true,
-          "options": {
-            "timeout": 120000
-          },
-          "headerParametersJson": "={\n  \"X-API-Key\": \"{{$env.SERVICE_API_KEY || ''}}\"\n}",
-          "bodyParametersJson": "={\n  \"ticket_id\": $json.ticket_id,\n  \"text\": $json.text\n}"
-        }
-      },
-      {
-        "id": "noop-queued",
-        "name": "Stop queued",
-        "type": "n8n-nodes-base.noOp",
-        "typeVersion": 1,
-        "position": [
-          940,
-          260
-        ]
-      },
-      {
-        "id": "send-naumen",
-        "name": "Send comment to Naumen",
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4,
-        "position": [
-          460,
-          -160
-        ],
-        "parameters": {
-          "authentication": "predefinedCredentialType",
-          "nodeCredentialType": "httpHeaderAuth",
-          "method": "POST",
-          "url": "={{$env.NAUMEN_API_URL || 'https://naumen.example/api/tickets/' + $json.ticket_id + '/comments'}}",
-          "sendBody": true,
-          "jsonParameters": true,
-          "bodyParametersJson": "={\n  \"text\": $json.comment\n}",
-          "options": {
-            "timeout": 120000
-          }
-        },
-        "credentials": {
-          "httpHeaderAuth": {
-            "id": "1",
-            "name": "Naumen API"
-          }
-        }
-      }
-    ],
-    "connections": {
-      "Webhook": {
-        "main": [
-          [
-            {
-              "node": "IF Event Type",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "IF Event Type": {
-        "main": [
-          [
-            {
-              "node": "Send comment to Naumen",
-              "type": "main",
-              "index": 0
-            }
-          ],
-          [
-            {
-              "node": "IF Closed",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "IF Closed": {
-        "main": [
-          [
-            {
-              "node": "Stop for closed",
-              "type": "main",
-              "index": 0
-            }
-          ],
-          [
-            {
-              "node": "Call /process_ticket",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "Call /process_ticket": {
-        "main": [
-          [
-            {
-              "node": "Stop queued",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      }
+      "id": "Webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [0, 0]
     },
-    "settings": {
-      "saveExecutionProgress": true,
-      "saveManualExecutions": true
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json[\"event_type\"]}}",
+              "operation": "equal",
+              "value2": "ticket_result"
+            }
+          ]
+        }
+      },
+      "id": "IF_Event",
+      "name": "IF Event Type",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [300, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json[\"is_closed\"]}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "IF_Closed",
+      "name": "IF Closed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [300, 300]
+    },
+    {
+      "parameters": {},
+      "id": "Stop_Closed",
+      "name": "Stop for closed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [550, 250]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8080/process_ticket",
+        "sendBody": true,
+        "jsonParameters": true,
+        "bodyParametersJson": "={\n  \"ticket_id\": $json.ticket_id,\n  \"text\": $json.text\n}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "Call_Process",
+      "name": "Call /process_ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [600, 400]
+    },
+    {
+      "parameters": {},
+      "id": "Stop_Queued",
+      "name": "Stop queued",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [850, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://service-desk-dev.bank.corp.centercredit.kz/gateway/services/rest/createComment",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "accessKey",
+              "value": "PUT_YOUR_ACCESS_KEY_HERE"
+            },
+            {
+              "name": "params",
+              "value": "requestContent,user"
+            }
+          ]
+        },
+        "sendBody": true,
+        "jsonParameters": true,
+        "bodyParametersJson": "={\n  \"source\": $json.ticket_id,\n  \"text\": $json.comment\n}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "Send_Naumen",
+      "name": "Send comment to Service Desk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [600, -150]
     }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "IF Event Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Event Type": {
+      "main": [
+        [
+          {
+            "node": "Send comment to Service Desk",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF Closed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Closed": {
+      "main": [
+        [
+          {
+            "node": "Stop for closed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Call /process_ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call /process_ticket": {
+      "main": [
+        [
+          {
+            "node": "Stop queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
 }
