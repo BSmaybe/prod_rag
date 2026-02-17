@@ -7,7 +7,7 @@ RAG-сервис для Service Desk с архитектурой **FastAPI + Pos
 - **API (`api/`)**:
   - `POST /sd/tickets` — быстрый callback-приёмник (`202`), Naumen не блокируется.
   - `POST /process_ticket` — оркестрационный endpoint для n8n (`ticket_id`, `text`).
-  - `POST /ask` — ручной RAG-запрос.
+  - `POST /ask` — ручной RAG-запрос (`context_count` управляет количеством retrieved chunks).
   - `POST /manage/reindex` — доиндексация CSV (legacy/manual).
 - **Postgres** — системный журнал `tickets_inbox` (все входящие события).
 - **Qdrant (`kb_tickets`)** — только KB-кейсы (закрытые и прошедшие фильтр качества).
@@ -73,9 +73,15 @@ curl -X DELETE "http://localhost:6333/collections/${COLLECTION_NAME:-kb_tickets}
 - `DB_URL`, `POSTGRES_*`
 - `QDRANT_URL`, `COLLECTION_NAME=kb_tickets`
 - `OLLAMA_URL`, `OLLAMA_MODEL`
+- `ASK_DEFAULT_TOP_K=3`, `ASK_MAX_TOP_K=10`, `PROCESS_TOP_K=3`
 - `N8N_WEBHOOK_URL`, `WEBHOOK_URL`
 - `NAUMEN_API_URL`
 - `SERVICE_API_KEY`/`SERVICE_DESK_API_KEY`
+
+## Настройка `context_count`
+- `context_count` в `/ask` — это число найденных контекстных фрагментов, которые попадают в prompt для LLM.
+- Чем больше `context_count`, тем выше latency (`prompt_eval`) и дольше ответ.
+- Рекомендованный быстрый профиль: `context_count=3` (`ASK_DEFAULT_TOP_K=3`).
 
 ## Логи
 HTTP middleware логирует `request_ts` и `duration_ms` для каждого запроса.

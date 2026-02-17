@@ -71,6 +71,8 @@ app.add_middleware(
 
 NO_CONTEXT_SCORE_THRESHOLD = float(os.getenv("NO_CONTEXT_SCORE_THRESHOLD", "0.35"))
 NO_CONTEXT_MIN_HITS = int(os.getenv("NO_CONTEXT_MIN_HITS", "2"))
+ASK_MAX_TOP_K = max(1, int(os.getenv("ASK_MAX_TOP_K", "10")))
+ASK_DEFAULT_TOP_K = max(1, min(ASK_MAX_TOP_K, int(os.getenv("ASK_DEFAULT_TOP_K", "3"))))
 
 OUTBOX_POLL_SEC = float(os.getenv("OUTBOX_POLL_SEC", "2"))
 OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
@@ -566,11 +568,11 @@ async def log_requests(request: Request, call_next):
             response.headers["X-Request-ID"] = request_id
 
 
-FORM_HTML = """<form method='post' action='/ask' style="font-family:ui-sans-serif">
+FORM_HTML = f"""<form method='post' action='/ask' style="font-family:ui-sans-serif">
   <label>Текст запроса:</label><br>
   <textarea name='issue_text' rows=6 cols=80 placeholder='Опишите проблему…'></textarea><br><br>
   <label>Сколько контекстов (top_k):</label>
-  <input type='number' name='context_count' value='20' min='1' max='50' />
+  <input type='number' name='context_count' value='{ASK_DEFAULT_TOP_K}' min='1' max='{ASK_MAX_TOP_K}' />
   <button type='submit'>Ask</button>
 </form>"""
 
@@ -671,7 +673,7 @@ def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], 
 def ask(
     request: Request,
     issue_text: str = Form(...),
-    context_count: int = Form(20),
+    context_count: int = Form(ASK_DEFAULT_TOP_K),
     service: str | None = Form(None),  # оставили в API, но не передаём в search_hits
 ):
     """
@@ -695,7 +697,7 @@ def ask(
 
     # 1) Поиск контекста в Qdrant
     try:
-        top_k = max(1, min(50, int(context_count)))
+        top_k = max(1, min(ASK_MAX_TOP_K, int(context_count)))
         with _stage(timings, "retrieval_ms"):
             results = search_hits(issue_text, top_k=top_k) or []
     except Exception as e:
