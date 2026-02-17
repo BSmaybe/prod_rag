@@ -73,6 +73,9 @@ NO_CONTEXT_SCORE_THRESHOLD = float(os.getenv("NO_CONTEXT_SCORE_THRESHOLD", "0.35
 NO_CONTEXT_MIN_HITS = int(os.getenv("NO_CONTEXT_MIN_HITS", "2"))
 ASK_MAX_TOP_K = max(1, int(os.getenv("ASK_MAX_TOP_K", "10")))
 ASK_DEFAULT_TOP_K = max(1, min(ASK_MAX_TOP_K, int(os.getenv("ASK_DEFAULT_TOP_K", "3"))))
+LLM_MAX_CHUNK_CHARS = max(1, int(os.getenv("LLM_MAX_CHUNK_CHARS", "900")))
+LLM_MAX_CONTEXT_CHARS = max(1, int(os.getenv("LLM_MAX_CONTEXT_CHARS", "2800")))
+LLM_MIN_TAIL_CHARS = max(1, int(os.getenv("LLM_MIN_TAIL_CHARS", "220")))
 
 OUTBOX_POLL_SEC = float(os.getenv("OUTBOX_POLL_SEC", "2"))
 OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
@@ -300,6 +303,7 @@ def _run_ticket_reasoning(
         used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
         top1_score = float(scores[0]) if scores else 0.0
         context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
+        context_info = _build_limited_context(context_chunks_nonempty)
         if not context_chunks_nonempty:
             top1_score = 0.0
         retrieval_ms = (time.perf_counter() - t_retrieval) * 1000.0
@@ -325,6 +329,10 @@ def _run_ticket_reasoning(
                 "top1_score": top1_score,
                 "used_chunks": used_snippets,
                 "used_context_len": len(hits),
+                "ctx_chunks_in": int(context_info.get("chunks_in", 0) or 0),
+                "ctx_chunks_used": int(context_info.get("chunks_used", 0) or 0),
+                "ctx_raw_chars": int(context_info.get("raw_chars", 0) or 0),
+                "ctx_used_chars": int(context_info.get("used_chars", 0) or 0),
                 "original_text": clean_text,
                 "retrieval_ms": retrieval_ms,
                 "llm_ms": llm_ms,
@@ -332,7 +340,11 @@ def _run_ticket_reasoning(
                 "total_ms": total_ms,
             }
 
-        context = "\n\n---\n\n".join(context_chunks_nonempty)
+        context = str(context_info.get("context") or "")
+        if not context:
+            context = context_chunks_nonempty[0][:LLM_MAX_CONTEXT_CHARS]
+            context_info["chunks_used"] = 1
+            context_info["used_chars"] = len(context)
 
         # ---- llm
         t_llm = time.perf_counter()
@@ -388,6 +400,10 @@ def _run_ticket_reasoning(
             "rag_response": structured_response,
             "used_context_len": len(hits),
             "used_chunks": used_snippets,
+            "ctx_chunks_in": int(context_info.get("chunks_in", 0) or 0),
+            "ctx_chunks_used": int(context_info.get("chunks_used", 0) or 0),
+            "ctx_raw_chars": int(context_info.get("raw_chars", 0) or 0),
+            "ctx_used_chars": int(context_info.get("used_chars", 0) or 0),
             "retrieval_ms": retrieval_ms,
             "llm_ms": llm_ms,
             "format_ms": format_ms,
@@ -450,11 +466,16 @@ async def _ticket_job_worker_loop() -> None:
                     total_ms = (time.perf_counter() - t_total) * 1000.0
                     log.info(
                         "process_job_timing job_id=%s ticket_id=%s status=%s queue_wait_ms=%.1f "
+                        "ctx_chunks_in=%s ctx_chunks_used=%s ctx_raw_chars=%s ctx_used_chars=%s "
                         "retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f total_ms=%.1f outbox_id=%s",
                         job_id,
                         ticket_id,
                         result.get("status", "error"),
                         queue_wait_ms,
+                        int(result.get("ctx_chunks_in", 0) or 0),
+                        int(result.get("ctx_chunks_used", 0) or 0),
+                        int(result.get("ctx_raw_chars", 0) or 0),
+                        int(result.get("ctx_used_chars", 0) or 0),
                         float(result.get("retrieval_ms", 0.0) or 0.0),
                         float(result.get("llm_ms", 0.0) or 0.0),
                         float(result.get("format_ms", 0.0) or 0.0),
@@ -669,6 +690,85 @@ def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], 
     return used_ids, snippets, chunks, scores
 
 
+def _normalize_chunk_text(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _build_limited_context(
+    chunks: list[str],
+    *,
+    max_chunk_chars: int | None = None,
+    max_context_chars: int | None = None,
+    min_tail_chars: int | None = None,
+) -> dict[str, Any]:
+    """
+    Собирает контекст для LLM с лимитами:
+    - режем каждый chunk до max_chunk_chars;
+    - общий контекст режем до max_context_chars;
+    - если следующий chunk не влезает, можем добавить "хвост", если есть место >= min_tail_chars.
+    """
+    sep = "\n\n---\n\n"
+    max_chunk = max(1, int(max_chunk_chars or LLM_MAX_CHUNK_CHARS))
+    max_context = max(1, int(max_context_chars or LLM_MAX_CONTEXT_CHARS))
+    min_tail = max(1, int(min_tail_chars or LLM_MIN_TAIL_CHARS))
+
+    normalized_raw: list[str] = []
+    raw_chars = 0
+    for chunk in chunks or []:
+        text = _normalize_chunk_text(chunk)
+        if not text:
+            continue
+        normalized_raw.append(text)
+        raw_chars += len(text)
+
+    if not normalized_raw:
+        return {
+            "context": "",
+            "chunks_in": 0,
+            "chunks_used": 0,
+            "raw_chars": 0,
+            "used_chars": 0,
+        }
+
+    normalized = [text[:max_chunk] for text in normalized_raw]
+    parts: list[str] = []
+    used_chars = 0
+
+    for chunk in normalized:
+        sep_len = len(sep) if parts else 0
+        full_len = sep_len + len(chunk)
+        if used_chars + full_len <= max_context:
+            if parts:
+                used_chars += len(sep)
+            parts.append(chunk)
+            used_chars += len(chunk)
+            continue
+
+        # Этот chunk целиком не помещается — попробуем взять "хвост" по остатку.
+        remaining = max_context - used_chars - sep_len
+        if remaining >= min_tail:
+            tail = chunk[-remaining:] if parts else chunk[:remaining]
+            if parts:
+                used_chars += len(sep)
+            parts.append(tail)
+            used_chars += len(tail)
+        break
+
+    if not parts:
+        fallback = normalized[0][:max_context]
+        parts = [fallback] if fallback else []
+        used_chars = len(fallback)
+
+    context = sep.join(parts)
+    return {
+        "context": context,
+        "chunks_in": len(normalized_raw),
+        "chunks_used": len(parts),
+        "raw_chars": raw_chars,
+        "used_chars": len(context),
+    }
+
+
 @app.post("/ask")
 def ask(
     request: Request,
@@ -710,6 +810,7 @@ def ask(
         timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
         log.info(
             "ask_timing request_id=%s query_len=%s top_k=%s hits=0 "
+            "ctx_chunks_in=0 ctx_chunks_used=0 ctx_raw_chars=0 ctx_used_chars=0 "
             "retrieval_ms=%.1f total_ms=%.1f",
             getattr(request.state, "request_id", "-"),
             len(issue_text),
@@ -725,10 +826,12 @@ def ask(
     used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(results)
 
     context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
+    context_info = _build_limited_context(context_chunks_nonempty)
     if not context_chunks_nonempty:
         timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
         log.info(
             "ask_timing request_id=%s query_len=%s top_k=%s hits=%s "
+            "ctx_chunks_in=0 ctx_chunks_used=0 ctx_raw_chars=0 ctx_used_chars=0 "
             "retrieval_ms=%.1f stage=context_parse_failed total_ms=%.1f",
             getattr(request.state, "request_id", "-"),
             len(issue_text),
@@ -745,7 +848,31 @@ def ask(
             },
         )
 
-    context = "\n\n---\n\n".join(context_chunks_nonempty)
+    context = str(context_info.get("context") or "")
+    if not context:
+        timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
+        log.info(
+            "ask_timing request_id=%s query_len=%s top_k=%s hits=%s "
+            "ctx_chunks_in=%s ctx_chunks_used=%s ctx_raw_chars=%s ctx_used_chars=%s "
+            "retrieval_ms=%.1f stage=context_limit_empty total_ms=%.1f",
+            getattr(request.state, "request_id", "-"),
+            len(issue_text),
+            top_k,
+            len(results),
+            int(context_info.get("chunks_in", 0) or 0),
+            int(context_info.get("chunks_used", 0) or 0),
+            int(context_info.get("raw_chars", 0) or 0),
+            int(context_info.get("used_chars", 0) or 0),
+            float(timings.get("retrieval_ms", 0.0) or 0.0),
+            float(timings.get("total_ms", 0.0) or 0.0),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "context_limit_empty",
+                "message": "Контекст после лимитирования оказался пустым.",
+            },
+        )
 
     # 2) Генерация LLM через Ollama
     try:
@@ -761,12 +888,17 @@ def ask(
         timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
         log.info(
             "ask_timing request_id=%s query_len=%s top_k=%s hits=%s top1_score=%.4f "
+            "ctx_chunks_in=%s ctx_chunks_used=%s ctx_raw_chars=%s ctx_used_chars=%s "
             "retrieval_ms=%.1f llm_ms=%.1f total_ms=%.1f llm_failed=%s",
             getattr(request.state, "request_id", "-"),
             len(issue_text),
             top_k,
             len(results),
             float(scores[0]) if scores else 0.0,
+            int(context_info.get("chunks_in", 0) or 0),
+            int(context_info.get("chunks_used", 0) or 0),
+            int(context_info.get("raw_chars", 0) or 0),
+            int(context_info.get("used_chars", 0) or 0),
             float(timings.get("retrieval_ms", 0.0) or 0.0),
             float(timings.get("llm_ms", 0.0) or 0.0),
             float(timings.get("total_ms", 0.0) or 0.0),
@@ -785,11 +917,16 @@ def ask(
         timings["total_ms"] = (time.perf_counter() - total_t0) * 1000.0
         log.info(
             "ask_timing request_id=%s query_len=%s top_k=%s hits=%s "
+            "ctx_chunks_in=%s ctx_chunks_used=%s ctx_raw_chars=%s ctx_used_chars=%s "
             "retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f total_ms=%.1f format_failed=%s",
             getattr(request.state, "request_id", "-"),
             len(issue_text),
             top_k,
             len(results),
+            int(context_info.get("chunks_in", 0) or 0),
+            int(context_info.get("chunks_used", 0) or 0),
+            int(context_info.get("raw_chars", 0) or 0),
+            int(context_info.get("used_chars", 0) or 0),
             float(timings.get("retrieval_ms", 0.0) or 0.0),
             float(timings.get("llm_ms", 0.0) or 0.0),
             float(timings.get("format_ms", 0.0) or 0.0),
@@ -826,15 +963,17 @@ def ask(
     # лог метрик — ключевой
     log.info(
         "ask_timing request_id=%s query_len=%s top_k=%s hits=%s top1_score=%.4f "
-        "ctx_chunks=%s ctx_chars=%s "
+        "ctx_chunks_in=%s ctx_chunks_used=%s ctx_raw_chars=%s ctx_used_chars=%s "
         "retrieval_ms=%.1f llm_ms=%.1f format_ms=%.1f postprocess_ms=%.1f total_ms=%.1f",
         getattr(request.state, "request_id", "-"),
         len(issue_text),
         top_k,
         len(results),
         float(scores[0]) if scores else 0.0,
-        len(context_chunks_nonempty),
-        len(context),
+        int(context_info.get("chunks_in", 0) or 0),
+        int(context_info.get("chunks_used", 0) or 0),
+        int(context_info.get("raw_chars", 0) or 0),
+        int(context_info.get("used_chars", 0) or 0),
         float(timings.get("retrieval_ms", 0.0) or 0.0),
         float(timings.get("llm_ms", 0.0) or 0.0),
         float(timings.get("format_ms", 0.0) or 0.0),

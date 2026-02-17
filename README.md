@@ -13,6 +13,7 @@ RAG-сервис для Service Desk с архитектурой **FastAPI + Pos
 - **Qdrant (`kb_tickets`)** — только KB-кейсы (закрытые и прошедшие фильтр качества).
 - **Ollama** — генерация ответа.
 - **n8n** — оркестрация: webhook от API -> `/process_ticket` -> комментарий в Naumen.
+- **Reranker** — пока не включён (active runtime без BM25/cross-encoder).
 - **Идентификаторы тикета в интеграции:**
   - `ticket_id` — внутренний ID Naumen (`serviceCall$...`), используется как `source` при `createComment`.
   - `issue_key` — человекочитаемый номер (`RP...`), хранится для трассировки и логов.
@@ -74,14 +75,16 @@ curl -X DELETE "http://localhost:6333/collections/${COLLECTION_NAME:-kb_tickets}
 - `QDRANT_URL`, `COLLECTION_NAME=kb_tickets`
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `ASK_DEFAULT_TOP_K=3`, `ASK_MAX_TOP_K=10`, `PROCESS_TOP_K=3`
+- `LLM_MAX_CHUNK_CHARS=900`, `LLM_MAX_CONTEXT_CHARS=2800`, `LLM_MIN_TAIL_CHARS=220`
 - `N8N_WEBHOOK_URL`, `WEBHOOK_URL`
 - `NAUMEN_API_URL`
 - `SERVICE_API_KEY`/`SERVICE_DESK_API_KEY`
 
 ## Настройка `context_count`
-- `context_count` в `/ask` — это число найденных контекстных фрагментов, которые попадают в prompt для LLM.
+- `context_count` в `/ask` — это число retrieved chunks до лимитирования.
+- Перед вызовом LLM контекст дополнительно ограничивается `LLM_MAX_*` параметрами.
 - Чем больше `context_count`, тем выше latency (`prompt_eval`) и дольше ответ.
-- Рекомендованный быстрый профиль: `context_count=3` (`ASK_DEFAULT_TOP_K=3`).
+- Рекомендованный быстрый профиль: `context_count=3`, `PROCESS_TOP_K=3`, `LLM_MAX_CONTEXT_CHARS=2800`.
 
 ## Логи
 HTTP middleware логирует `request_ts` и `duration_ms` для каждого запроса.
