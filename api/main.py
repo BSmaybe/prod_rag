@@ -24,6 +24,7 @@ from api.db import (
     enqueue_outbox_event,
     enqueue_ticket_job,
     ensure_schema,
+    get_ticket_issue_key,
     get_ticket_job,
     mark_outbox_dead,
     mark_outbox_retry,
@@ -155,6 +156,7 @@ def _mark_ticket_job_done_and_enqueue_result_sync(
     result_payload: dict[str, Any],
 ) -> int:
     with db_conn() as conn:
+        issue_key = get_ticket_issue_key(conn, ticket_id=ticket_id) or ""
         mark_ticket_job_done(conn, job_id=job_id, result_payload=result_payload, autocommit=False)
         outbox_id = enqueue_outbox_event(
             conn,
@@ -163,6 +165,7 @@ def _mark_ticket_job_done_and_enqueue_result_sync(
                 "event_type": "ticket_result",
                 "job_id": job_id,
                 "ticket_id": ticket_id,
+                "issue_key": issue_key,
                 "status": result_payload.get("status", "error"),
                 "comment": result_payload.get("comment", ""),
                 "used_issue_keys": result_payload.get("used_issue_keys", []),

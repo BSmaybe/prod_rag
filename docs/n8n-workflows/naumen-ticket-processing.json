@@ -19,7 +19,7 @@
         "conditions": {
           "string": [
             {
-              "value1": "={{$json[\"event_type\"]}}",
+              "value1": "={{$json.body.event_type || $json.event_type}}",
               "operation": "equal",
               "value2": "ticket_result"
             }
@@ -37,7 +37,7 @@
         "conditions": {
           "boolean": [
             {
-              "value1": "={{$json[\"is_closed\"]}}",
+              "value1": "={{$json.body.is_closed ?? $json.is_closed}}",
               "operation": "isTrue"
             }
           ]
@@ -63,7 +63,7 @@
         "url": "http://api:8080/process_ticket",
         "sendBody": true,
         "jsonParameters": true,
-        "bodyParametersJson": "={\n  \"ticket_id\": $json.ticket_id,\n  \"text\": $json.text\n}",
+        "bodyParametersJson": "={\n  \"ticket_id\": $json.body.ticket_id || $json.ticket_id,\n  \"text\": $json.body.text || $json.text\n}",
         "options": {
           "timeout": 120000
         }
@@ -101,7 +101,7 @@
         },
         "sendBody": true,
         "jsonParameters": true,
-        "bodyParametersJson": "={\n  \"source\": $json.ticket_id,\n  \"text\": $json.comment\n}",
+        "bodyParametersJson": "={\n  \"source\": $json.body.ticket_id || $json.ticket_id,\n  \"text\": $json.body.comment || $json.comment\n}",
         "options": {
           "timeout": 120000
         }

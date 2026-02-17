@@ -107,6 +107,13 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             ON tickets_inbox(updated_at DESC);
             """
         )
+        cur.execute("ALTER TABLE tickets_inbox ADD COLUMN IF NOT EXISTS issue_key text;")
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tickets_inbox_issue_key
+            ON tickets_inbox(issue_key);
+            """
+        )
 
         cur.execute(
             """
@@ -186,6 +193,7 @@ def upsert_ticket_event(
     conn: psycopg.Connection,
     *,
     ticket_id: str,
+    issue_key: str | None = None,
     status: str,
     text_anonymized: str,
     raw_payload: dict[str, Any],
@@ -196,13 +204,17 @@ def upsert_ticket_event(
         cur.execute(
             """
             INSERT INTO tickets_inbox (
-                ticket_id, status, text_anonymized, raw_payload, trace_id
+                ticket_id, issue_key, status, text_anonymized, raw_payload, trace_id
             ) VALUES (
-                %s, %s, %s, %s::jsonb, %s
+                %s, %s, %s, %s, %s::jsonb, %s
             )
             ON CONFLICT (ticket_id)
             DO UPDATE SET
                 updated_at = now(),
+                issue_key = CASE
+                    WHEN COALESCE(NULLIF(EXCLUDED.issue_key, ''), '') <> '' THEN EXCLUDED.issue_key
+                    ELSE tickets_inbox.issue_key
+                END,
                 status = EXCLUDED.status,
                 text_anonymized = EXCLUDED.text_anonymized,
                 raw_payload = EXCLUDED.raw_payload,
@@ -210,6 +222,7 @@ def upsert_ticket_event(
             """,
             (
                 ticket_id,
+                issue_key,
                 status,
                 text_anonymized,
                 json.dumps(raw_payload, ensure_ascii=False),
@@ -527,7 +540,7 @@ def get_ticket(conn: psycopg.Connection, ticket_id: str) -> dict[str, Any] | Non
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT ticket_id, status, text_anonymized, raw_payload, trace_id,
+            SELECT ticket_id, issue_key, status, text_anonymized, raw_payload, trace_id,
                    created_at, updated_at, last_comment_sent
             FROM tickets_inbox
             WHERE ticket_id = %s
@@ -536,3 +549,23 @@ def get_ticket(conn: psycopg.Connection, ticket_id: str) -> dict[str, Any] | Non
         )
         row = cur.fetchone()
     return dict(row) if row else None
+
+
+def get_ticket_issue_key(conn: psycopg.Connection, ticket_id: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT issue_key
+            FROM tickets_inbox
+            WHERE ticket_id = %s
+            """,
+            (ticket_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    issue_key = row[0]
+    if issue_key is None:
+        return None
+    issue_key_str = str(issue_key).strip()
+    return issue_key_str or None

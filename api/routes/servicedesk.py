@@ -448,6 +448,7 @@ def _build_n8n_payload(
     payload: Dict[str, Any] = {
         "event_type": "ticket_received",
         "ticket_id": ticket_id,
+        "issue_key": (flat.get("issue_key") or "").strip(),
         "text": _normalize_text(text_anonymized),  # страховка от &nbsp;/\xa0
         "trace_id": trace_id,
         "state": state,
@@ -535,6 +536,7 @@ async def ingest_from_sd(request: Request):
                     upsert_ticket_event(
                         conn,
                         ticket_id=ticket_id,
+                        issue_key=ticket_id,
                         status="new",
                         text_anonymized=clean_text,
                         raw_payload={"tickets_item": t.model_dump(), "parsed": body},
@@ -577,6 +579,7 @@ async def ingest_from_sd(request: Request):
                     upsert_ticket_event(
                         conn,
                         ticket_id=fallback_id,
+                        issue_key="",
                         status="new",
                         text_anonymized=fallback_text,
                         raw_payload=body,
@@ -599,6 +602,7 @@ async def ingest_from_sd(request: Request):
                     upsert_ticket_event(
                         conn,
                         ticket_id=ticket_id,
+                        issue_key="",
                         status="new",
                         text_anonymized=anonymize_text(raw_dump),
                         raw_payload=body,
@@ -629,6 +633,7 @@ async def ingest_from_sd(request: Request):
                 upsert_ticket_event(
                     conn,
                     ticket_id=ticket_id,
+                    issue_key=issue_key.strip(),
                     status=status,
                     text_anonymized=clean_text,
                     raw_payload=body,
