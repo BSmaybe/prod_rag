@@ -690,10 +690,11 @@ def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], 
 
     for h in hits or []:
         key, text, score = _hit_to_row(h)
+        kb_id = key or "-"
         used_ids.append(key)
         scores.append(float(score))
         chunks.append(
-            f"[CASE issue_key={key or '-'} score={float(score):.4f}]\n{text or ''}".strip()
+            f"[kb:{kb_id}] [score:{float(score):.4f}]\n{text or ''}".strip()
         )
         snippets.append((text or "")[:300])
 
