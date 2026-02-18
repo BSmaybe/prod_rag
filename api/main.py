@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -76,6 +77,11 @@ ASK_DEFAULT_TOP_K = max(1, min(ASK_MAX_TOP_K, int(os.getenv("ASK_DEFAULT_TOP_K",
 LLM_MAX_CHUNK_CHARS = max(1, int(os.getenv("LLM_MAX_CHUNK_CHARS", "900")))
 LLM_MAX_CONTEXT_CHARS = max(1, int(os.getenv("LLM_MAX_CONTEXT_CHARS", "2800")))
 LLM_MIN_TAIL_CHARS = max(1, int(os.getenv("LLM_MIN_TAIL_CHARS", "220")))
+RERANK_ENABLED = (os.getenv("RERANK_ENABLED", "true").lower() in {"1", "true", "yes", "on"})
+RERANK_POOL_MULTIPLIER = max(1, int(os.getenv("RERANK_POOL_MULTIPLIER", "3")))
+RERANK_WEIGHT_VECTOR = float(os.getenv("RERANK_WEIGHT_VECTOR", "0.65"))
+RERANK_WEIGHT_LEXICAL = float(os.getenv("RERANK_WEIGHT_LEXICAL", "0.35"))
+RERANK_OVERLAP_BOOST = float(os.getenv("RERANK_OVERLAP_BOOST", "0.20"))
 
 OUTBOX_POLL_SEC = float(os.getenv("OUTBOX_POLL_SEC", "2"))
 OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
@@ -296,10 +302,12 @@ def _run_ticket_reasoning(
 
     try:
         top_k = int(os.getenv("PROCESS_TOP_K", "5"))
+        candidate_k = max(top_k, top_k * RERANK_POOL_MULTIPLIER)
 
         # ---- retrieval
         t_retrieval = time.perf_counter()
-        hits = search_hits(clean_text, top_k=top_k) or []
+        hits_raw = search_hits(clean_text, top_k=candidate_k) or []
+        hits = _rerank_hits(clean_text, hits_raw, top_k)
         used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
         top1_score = float(scores[0]) if scores else 0.0
         context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
@@ -684,7 +692,9 @@ def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], 
         key, text, score = _hit_to_row(h)
         used_ids.append(key)
         scores.append(float(score))
-        chunks.append(text or "")
+        chunks.append(
+            f"[CASE issue_key={key or '-'} score={float(score):.4f}]\n{text or ''}".strip()
+        )
         snippets.append((text or "")[:300])
 
     return used_ids, snippets, chunks, scores
@@ -692,6 +702,64 @@ def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], 
 
 def _normalize_chunk_text(text: str) -> str:
     return " ".join((text or "").split()).strip()
+
+
+def _tokenize_for_rerank(text: str) -> set[str]:
+    terms = re.findall(r"[\w\-]{2,}", (text or "").lower())
+    stop = {
+        "что",
+        "это",
+        "как",
+        "для",
+        "при",
+        "или",
+        "если",
+        "где",
+        "после",
+        "перед",
+        "ошибка",
+        "инцидент",
+        "problem",
+        "service",
+    }
+    return {t for t in terms if t not in stop}
+
+
+def _rerank_hits(query: str, hits: list[Any], top_k: int) -> list[Any]:
+    if not hits:
+        return []
+
+    if not RERANK_ENABLED or len(hits) <= top_k:
+        return hits[:top_k]
+
+    parsed: list[tuple[Any, str, float, Any]] = []
+    for h in hits:
+        key, text, score = _hit_to_row(h)
+        parsed.append((key, text or "", float(score), h))
+
+    vec_scores = [p[2] for p in parsed]
+    min_s = min(vec_scores)
+    max_s = max(vec_scores)
+    span = max(max_s - min_s, 1e-9)
+
+    q_tokens = _tokenize_for_rerank(query)
+
+    ranked: list[tuple[float, Any]] = []
+    for _, text, score, raw in parsed:
+        t_tokens = _tokenize_for_rerank(text)
+        overlap = len(q_tokens & t_tokens)
+        union = len(q_tokens | t_tokens)
+        lexical = (overlap / union) if union else 0.0
+        vec_norm = (score - min_s) / span
+        final = (RERANK_WEIGHT_VECTOR * vec_norm) + (RERANK_WEIGHT_LEXICAL * lexical)
+        if overlap > 0:
+            final += RERANK_OVERLAP_BOOST
+        elif q_tokens:
+            final *= 0.5
+        ranked.append((final, raw))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in ranked[:top_k]]
 
 
 def _build_limited_context(
@@ -798,8 +866,10 @@ def ask(
     # 1) Поиск контекста в Qdrant
     try:
         top_k = max(1, min(ASK_MAX_TOP_K, int(context_count)))
+        candidate_k = max(top_k, top_k * RERANK_POOL_MULTIPLIER)
         with _stage(timings, "retrieval_ms"):
-            results = search_hits(issue_text, top_k=top_k) or []
+            raw_results = search_hits(issue_text, top_k=candidate_k) or []
+            results = _rerank_hits(issue_text, raw_results, top_k)
     except Exception as e:
         return JSONResponse(
             status_code=500,
