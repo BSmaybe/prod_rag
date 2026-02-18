@@ -13,7 +13,7 @@ RAG-сервис для Service Desk с архитектурой **FastAPI + Pos
 - **Qdrant (`kb_tickets`)** — только KB-кейсы (закрытые и прошедшие фильтр качества).
 - **Ollama** — генерация ответа.
 - **n8n** — оркестрация: webhook от API -> `/process_ticket` -> комментарий в Naumen.
-- **Reranker** — пока не включён (active runtime без BM25/cross-encoder).
+- **Reranker** — включён лёгкий гибридный реранк (vector score + lexical overlap) перед LLM.
 - **Идентификаторы тикета в интеграции:**
   - `ticket_id` — внутренний ID Naumen (`serviceCall$...`), используется как `source` при `createComment`.
   - `issue_key` — человекочитаемый номер (`RP...`), хранится для трассировки и логов.
@@ -76,6 +76,8 @@ curl -X DELETE "http://localhost:6333/collections/${COLLECTION_NAME:-kb_tickets}
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `ASK_DEFAULT_TOP_K=3`, `ASK_MAX_TOP_K=10`, `PROCESS_TOP_K=3`
 - `LLM_MAX_CHUNK_CHARS=900`, `LLM_MAX_CONTEXT_CHARS=2800`, `LLM_MIN_TAIL_CHARS=220`
+- `RERANK_ENABLED=true`, `RERANK_POOL_MULTIPLIER=3`
+- `RERANK_WEIGHT_VECTOR=0.65`, `RERANK_WEIGHT_LEXICAL=0.35`, `RERANK_OVERLAP_BOOST=0.20`
 - `N8N_WEBHOOK_URL`, `WEBHOOK_URL`
 - `NAUMEN_API_URL`
 - `SERVICE_API_KEY`/`SERVICE_DESK_API_KEY`
