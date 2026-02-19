@@ -288,6 +288,44 @@ def _clarification_template() -> str:
     )
 
 
+def _join_points(items: list[Any], fallback: str) -> str:
+    cleaned = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not cleaned:
+        return fallback
+    return "; ".join(cleaned)
+
+
+def _build_sd_comment(structured: dict[str, Any], raw_answer: str) -> str:
+    """Собирает стабильный комментарий для Service Desk из 4 обязательных пунктов."""
+    description = _join_points(
+        list(structured.get("description") or []),
+        "В данных KB подтверждения нет; требуется дополнительная проверка.",
+    )
+    causes = _join_points(
+        list(structured.get("causes") or []),
+        "В данных KB подтверждения нет; проверьте смежные системы и интеграции.",
+    )
+    actions = _join_points(
+        list(structured.get("actions") or []),
+        "Запросите логи и уточняющие данные у клиента для локализации инцидента.",
+    )
+    next_steps = _join_points(
+        list(structured.get("next_steps") or []),
+        "Общий вывод: требуется сбор фактов и точечная проверка по трассировке.",
+    )
+
+    comment = (
+        f"1) Суть инцидента: {description}\n"
+        f"2) Что проверить в системах: {causes}\n"
+        f"3) Рекомендации по действиям клиенту: {actions}\n"
+        f"4) Общий вывод: {next_steps}"
+    ).strip()
+
+    if len(comment) < 40 and (raw_answer or "").strip():
+        return raw_answer.strip()
+    return comment
+
+
 def _run_ticket_reasoning(
     *,
     ticket_id: str,
@@ -385,7 +423,7 @@ def _run_ticket_reasoning(
                 pass
         format_ms = (time.perf_counter() - t_format) * 1000.0
 
-        comment = structured_response.get("full_text", raw_answer)
+        comment = _build_sd_comment(structured_response, raw_answer)
 
         try:
             with db_conn() as conn:
