@@ -28,6 +28,9 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 # Параметры семплирования
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
+OLLAMA_REPEAT_PENALTY = float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.15"))
+OLLAMA_RESPONSE_MAX_CHARS = int(os.getenv("OLLAMA_RESPONSE_MAX_CHARS", "700"))
+OLLAMA_REWRITE_ON_LENGTH = os.getenv("OLLAMA_REWRITE_ON_LENGTH", "1") == "1"
 
 
 def build_prompt(context: str, question: str) -> str:
@@ -41,7 +44,9 @@ def build_prompt(context: str, question: str) -> str:
 - Опирайся только на факты из КОНТЕКСТА; не придумывай команды, системы и причины.
 - Для любой конкретики (ошибка, причина, действие, эскалация) указывай ссылку на источник в формате [kb:ISSUE_KEY].
 - Если подтверждения в КОНТЕКСТЕ нет — пиши: "В данных KB подтверждения нет" и укажи, что проверить.
-- Строго 5 разделов (1–5). Никаких лишних заголовков/текста до/после.
+- Строго 4 пункта (1–4), каждый пункт с новой строки.
+- Общий размер ответа: до {OLLAMA_RESPONSE_MAX_CHARS} символов.
+- Никаких вступлений, разделителей и подписей (например, "Инженер сопровождения", "---", "Ответ:").
 
 КОНТЕКСТ (фрагменты прошлых инцидентов):
 {context}
@@ -50,16 +55,42 @@ def build_prompt(context: str, question: str) -> str:
 \"\"\"{question}\"\"\"
 
 Формат ответа (строго):
-1) Суть / что видим:
-- ...
-2) Проверки (что сделать сейчас):
-- ...
-3) Вероятная причина:
-- ...
-4) Что эскалировать / кому:
-- ...
-5) Что спросить у клиента:
-- ...
+1) Суть инцидента:
+2) Что проверить в системах:
+3) Какие данные/логи запросить (если не хватает фактов):
+4) Что ответить клиенту:
+"""
+
+
+def _needs_rewrite(answer: str, done_reason: str | None) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return True
+    if done_reason != "length":
+        return False
+    # Если дошли до ограничения длины и финал похож на обрыв, перегенерируем короче и строже
+    return text[-1] not in ".!?;)"
+
+
+def _rewrite_prompt(question: str, context: str, draft: str) -> str:
+    return f"""Ниже черновик ответа, который получился слишком длинным или обрезанным.
+Перепиши его заново по требованиям, строго и кратко.
+
+Требования:
+- только русский язык;
+- строго 4 пункта: 1), 2), 3), 4);
+- общий размер до {OLLAMA_RESPONSE_MAX_CHARS} символов;
+- только конкретные проверки и действия без общих слов;
+- не добавляй текст до/после 4 пунктов.
+
+Инцидент:
+\"\"\"{question}\"\"\"
+
+Контекст KB:
+{context}
+
+Черновик (обрезанный):
+{draft}
 """
 
 
@@ -93,9 +124,17 @@ def generate_answer(
         "options": {
             "temperature": OLLAMA_TEMPERATURE,
             "top_p": OLLAMA_TOP_P,
+            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
             "num_ctx": OLLAMA_NUM_CTX,
             "num_predict": OLLAMA_NUM_PREDICT,
-            "stop": ["\n\n6)", "\n\n6.", "\n\nШестой", "\n\nИтог"],
+            "stop": [
+                "\n\n5)",
+                "\n\n5.",
+                "\n\nИтог",
+                "\n\n---",
+                "\n\nИнженер сопровождения",
+                "\n\nОтвет:",
+            ],
         },
     }
 
@@ -126,6 +165,7 @@ def generate_answer(
 
             data = _safe_json(resp)
             answer = str(data.get("response", "")).strip()
+            done_reason = str(data.get("done_reason") or "")
 
             # ---- метрики Ollama (если есть) ----
             total_ms = _ns_to_ms(data.get("total_duration"))
@@ -140,14 +180,36 @@ def generate_answer(
                 tok_s = ev_cnt / (ev_ms / 1000.0)
 
             if answer:
+                if OLLAMA_REWRITE_ON_LENGTH and _needs_rewrite(answer, done_reason):
+                    rewrite_payload = {
+                        "model": OLLAMA_MODEL,
+                        "prompt": _rewrite_prompt(question, context, answer),
+                        "stream": False,
+                        "options": {
+                            "temperature": min(OLLAMA_TEMPERATURE, 0.15),
+                            "top_p": OLLAMA_TOP_P,
+                            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+                            "num_ctx": OLLAMA_NUM_CTX,
+                            "num_predict": OLLAMA_NUM_PREDICT,
+                            "stop": ["\n\n5)", "\n\n---", "\n\nОтвет:"],
+                        },
+                    }
+                    rewrite_resp = requests.post(OLLAMA_URL, json=rewrite_payload, timeout=timeout)
+                    if rewrite_resp.status_code < 400:
+                        rewrite_data = _safe_json(rewrite_resp)
+                        rewrite_answer = str(rewrite_data.get("response", "")).strip()
+                        if rewrite_answer:
+                            answer = rewrite_answer
+
                 log.info(
-                    "ollama_ok elapsed=%.1fs model=%s num_predict=%s "
+                    "ollama_ok elapsed=%.1fs model=%s num_predict=%s done_reason=%s "
                     "prompt_chars=%s context_chars=%s question_chars=%s "
                     "ollama_total_ms=%.1f load_ms=%.1f prompt_eval_cnt=%s prompt_eval_ms=%.1f "
                     "eval_cnt=%s eval_ms=%.1f tok_s=%.2f trace_id=%s job_id=%s",
                     dt,
                     OLLAMA_MODEL,
                     OLLAMA_NUM_PREDICT,
+                    done_reason or "-",
                     prompt_chars,
                     context_chars,
                     question_chars,
