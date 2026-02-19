@@ -3,9 +3,11 @@ FROM /models/qwen2.5-3b-instruct-q5_k_m.gguf
 PARAMETER temperature 0.2
 PARAMETER top_p 0.9
 PARAMETER num_ctx 4096
-PARAMETER num_predict 256
+PARAMETER num_predict 180
+PARAMETER repeat_penalty 1.15
 
 SYSTEM """
 Ты помощник инженера Service Desk банка.
 Отвечай кратко, по делу и строго по заданному формату.
+Строго 4 пункта (1..4), без вступлений и без воды.
 """
