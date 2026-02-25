@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import csv
 import glob
+import hashlib
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Any
 
 from core.vectordb import upsert_tickets, search_hits
 from etl.anonymize import anonymize_text
+from core.config import OLLAMA_URL, OLLAMA_MODEL
+import requests
 
 NEW_TICKETS_DIR = os.getenv("NEW_TICKETS_DIR", "/data/new_tickets")
 
@@ -93,6 +97,129 @@ def _parse_stopwords(raw: str) -> set[str]:
     return {s for s in (_normalize_for_stopwords(p) for p in parts) if s}
 
 
+def _get_env_str(name: str, default: str) -> str:
+    val = os.getenv(name)
+    return val if val is not None else default
+
+
+KB_JUDGE_ENABLED = _get_env_bool("KB_JUDGE_ENABLED", False)
+KB_JUDGE_MODEL = _get_env_str("KB_JUDGE_MODEL", OLLAMA_MODEL)
+KB_JUDGE_CACHE_DIR = _get_env_str("KB_JUDGE_CACHE_DIR", "data/tickets_clean")
+KB_JUDGE_MAX_CHARS = _get_env_int("KB_JUDGE_MAX_CHARS", 6000)
+KB_JUDGE_TIMEOUT_SEC = float(os.getenv("KB_JUDGE_TIMEOUT_SEC", "60"))
+KB_JUDGE_CONNECT_TIMEOUT_SEC = float(os.getenv("KB_JUDGE_CONNECT_TIMEOUT_SEC", "10"))
+KB_JUDGE_NUM_CTX = _get_env_int("KB_JUDGE_NUM_CTX", 2048)
+KB_JUDGE_NUM_PREDICT = _get_env_int("KB_JUDGE_NUM_PREDICT", 320)
+KB_JUDGE_MODE = _get_env_str("KB_JUDGE_MODE", "incident").strip().lower()
+
+
+def _sha1_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _cache_paths(digest: str) -> Tuple[Path, Path]:
+    base = Path(KB_JUDGE_CACHE_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+    clean_path = base / f"{digest}.clean.txt"
+    reject_path = base / f"{digest}.reject"
+    return clean_path, reject_path
+
+
+def _load_cached(clean_path: Path, reject_path: Path) -> Optional[str]:
+    if reject_path.exists():
+        return None
+    if clean_path.exists():
+        try:
+            return clean_path.read_text(encoding="utf-8")
+        except Exception:
+            return None
+    return None
+
+
+def _save_clean(clean_path: Path, text: str) -> None:
+    try:
+        clean_path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _save_reject(reject_path: Path) -> None:
+    try:
+        reject_path.write_text("REJECT", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _judge_prompt(raw_text: str) -> str:
+    if KB_JUDGE_MODE == "incident":
+        return f"""Ты — строгий IT-аудитор базы знаний.
+Твоя задача — проверить, содержит ли тикет полезную информацию для решения будущих проблем.
+
+Сырой тикет:
+\"\"\"{raw_text}\"\"\"
+
+Правила:
+1) Если НЕТ четкого описания проблемы ИЛИ НЕТ конкретных шагов решения (а только отписки), верни строго: REJECT
+2) Если тикет полезен, перепиши его строго в формате:
+СИМПТОМЫ: <кратко суть>
+РЕШЕНИЕ: <конкретные команды, проверки, действия>
+"""
+
+    # default incident mode
+    return f"""Ты — строгий IT-аудитор базы знаний.
+Сырой тикет:
+\"\"\"{raw_text}\"\"\"
+Верни строго: REJECT или
+СИМПТОМЫ: ...
+РЕШЕНИЕ: ...
+"""
+
+
+def _parse_judge_output(text: str) -> Tuple[str, str]:
+    t = _norm(text)
+    if not t:
+        return "", ""
+    if t.strip().upper().startswith("REJECT"):
+        return "", ""
+    sym = ""
+    sol = ""
+    for line in t.splitlines():
+        if line.strip().lower().startswith("симптомы"):
+            sym = line.split(":", 1)[-1].strip()
+        elif line.strip().lower().startswith("решение"):
+            sol = line.split(":", 1)[-1].strip()
+    return sym, sol
+
+
+def _judge_ticket(raw_text: str) -> Optional[Tuple[str, str]]:
+    prompt = _judge_prompt(raw_text[:KB_JUDGE_MAX_CHARS])
+    payload = {
+        "model": KB_JUDGE_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "num_ctx": KB_JUDGE_NUM_CTX,
+            "num_predict": KB_JUDGE_NUM_PREDICT,
+            "stop": ["\n\nREJECT", "\n\nОтвет:", "\n\n---"],
+        },
+    }
+
+    timeout = (KB_JUDGE_CONNECT_TIMEOUT_SEC, KB_JUDGE_TIMEOUT_SEC)
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"kb_judge_http_error {resp.status_code}")
+
+    data = resp.json() if resp.content else {}
+    answer = str(data.get("response", "")).strip()
+    sym, sol = _parse_judge_output(answer)
+    if not sym or not sol:
+        return None
+    return sym, sol
+
+
 def _build_dedup_text(problem_text: str, solution_text: str, service: str) -> str:
     parts: List[str] = []
     if service:
@@ -120,6 +247,9 @@ def _filter_kb_rows(
         "skipped_short_solution": 0,
         "skipped_stopword": 0,
         "skipped_dedup": 0,
+        "skipped_judge_reject": 0,
+        "judge_cached": 0,
+        "judge_ran": 0,
     }
 
     min_solution_len = _get_env_int("KB_MIN_SOLUTION_CHARS", 30)
@@ -147,6 +277,45 @@ def _filter_kb_rows(
             if _normalize_for_stopwords(solution) in stopwords:
                 counts["skipped_stopword"] += 1
                 continue
+
+        # ---- optional LLM judge (offline)
+        if KB_JUDGE_ENABLED:
+            raw_problem = _norm(r.get("text"))
+            raw_solution = _norm(r.get("solution_text"))
+            if raw_problem and raw_solution:
+                # anonymize before sending to LLM
+                judge_input = anonymize_text(f"{raw_problem}\n\nРешение:\n{raw_solution}")
+                digest = _sha1_text(judge_input)
+                clean_path, reject_path = _cache_paths(digest)
+                cached = _load_cached(clean_path, reject_path)
+                if cached is not None:
+                    counts["judge_cached"] += 1
+                    sym, sol = _parse_judge_output(cached)
+                    if not sym or not sol:
+                        counts["skipped_judge_reject"] += 1
+                        continue
+                    r["text"] = sym
+                    r["solution_text"] = sol
+                elif reject_path.exists():
+                    counts["skipped_judge_reject"] += 1
+                    continue
+                else:
+                    try:
+                        counts["judge_ran"] += 1
+                        judged = _judge_ticket(judge_input)
+                    except Exception:
+                        judged = None
+                    if not judged:
+                        _save_reject(reject_path)
+                        counts["skipped_judge_reject"] += 1
+                        continue
+                    sym, sol = judged
+                    r["text"] = sym
+                    r["solution_text"] = sol
+                    _save_clean(clean_path, f"СИМПТОМЫ: {sym}\nРЕШЕНИЕ: {sol}")
+
+        # refresh solution after possible judge rewrite
+        solution = _norm(r.get("solution_text"))
 
         if dedup_enabled:
             raw_problem = _norm(r.get("text"))
@@ -221,13 +390,16 @@ def ingest_new_tickets() -> int | dict[str, int]:
     rows, counts = _filter_kb_rows(rows)
     log.info(
         "kb_filter_summary total=%s kept=%s skipped_no_solution=%s skipped_short_solution=%s "
-        "skipped_stopword=%s skipped_dedup=%s",
+        "skipped_stopword=%s skipped_dedup=%s skipped_judge_reject=%s judge_cached=%s judge_ran=%s",
         counts["total_rows"],
         counts["kept"],
         counts["skipped_no_solution"],
         counts["skipped_short_solution"],
         counts["skipped_stopword"],
         counts["skipped_dedup"],
+        counts["skipped_judge_reject"],
+        counts["judge_cached"],
+        counts["judge_ran"],
     )
 
     if not rows:

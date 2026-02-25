@@ -75,6 +75,8 @@ POST /manage/reindex_articles
 - `KB_MIN_SOLUTION_CHARS=30` — не индексировать короткие решения.
 - `KB_STOPWORDS=...` — отсекает «отписки» вроде “Ок/Решено”.
 - `KB_DEDUP_ENABLED=1` — семантический дедуп (score >= `KB_DEDUP_SCORE`).
+Опционально включается LLM‑judge для тикетов (off-line при reindex):
+- `KB_JUDGE_ENABLED=1`, `KB_JUDGE_MODE=incident`
 
 ## Qdrant reset/reload
 1. Остановить входящий callback поток из Naumen.
@@ -102,6 +104,7 @@ curl -X DELETE "http://localhost:6333/collections/${COLLECTION_NAME:-kb_tickets}
 - `RERANK_WEIGHT_VECTOR=0.65`, `RERANK_WEIGHT_LEXICAL=0.35`, `RERANK_OVERLAP_BOOST=0.20`
 - `KB_MIN_SOLUTION_CHARS=30`, `KB_REQUIRE_SOLUTION=1`
 - `KB_STOPWORDS=решено,...`, `KB_DEDUP_ENABLED=1`, `KB_DEDUP_SCORE=0.92`, `KB_DEDUP_TOP_K=1`
+- `KB_JUDGE_ENABLED=0`, `KB_JUDGE_CACHE_DIR=data/tickets_clean`
 - `N8N_WEBHOOK_URL`, `WEBHOOK_URL`
 - `NAUMEN_API_URL`
 - `SERVICE_API_KEY`/`SERVICE_DESK_API_KEY`

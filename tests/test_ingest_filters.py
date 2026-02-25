@@ -57,3 +57,51 @@ def test_filter_dedup(monkeypatch):
     rows, counts = ingest_new._filter_kb_rows([_row("Решение: проверить логи и перезапустить")], search_fn=_hits)
     assert rows == []
     assert counts["skipped_dedup"] == 1
+
+
+def test_kb_judge_accept(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        @property
+        def content(self):
+            return b"{}"
+
+        def json(self):
+            return {"response": "СИМПТОМЫ: сбой платежа\nРЕШЕНИЕ: проверить логи"}
+
+    monkeypatch.setattr(ingest_new, "KB_JUDGE_ENABLED", True)
+    monkeypatch.setattr(ingest_new, "KB_JUDGE_MODE", "incident")
+    monkeypatch.setattr(ingest_new, "requests", type("R", (), {"post": lambda *a, **k: _Resp()})())
+    monkeypatch.setenv("KB_DEDUP_ENABLED", "0")
+    monkeypatch.setenv("KB_REQUIRE_SOLUTION", "1")
+    monkeypatch.setenv("KB_MIN_SOLUTION_CHARS", "1")
+
+    rows, counts = ingest_new._filter_kb_rows([_row("Решение: проверить логи")], search_fn=lambda q, top_k=1: [])
+    assert rows
+    assert rows[0]["text"]
+    assert rows[0]["solution_text"]
+    assert counts["skipped_judge_reject"] == 0
+
+
+def test_kb_judge_reject(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        @property
+        def content(self):
+            return b"{}"
+
+        def json(self):
+            return {"response": "REJECT"}
+
+    monkeypatch.setattr(ingest_new, "KB_JUDGE_ENABLED", True)
+    monkeypatch.setattr(ingest_new, "KB_JUDGE_MODE", "incident")
+    monkeypatch.setattr(ingest_new, "requests", type("R", (), {"post": lambda *a, **k: _Resp()})())
+    monkeypatch.setenv("KB_DEDUP_ENABLED", "0")
+    monkeypatch.setenv("KB_REQUIRE_SOLUTION", "1")
+    monkeypatch.setenv("KB_MIN_SOLUTION_CHARS", "1")
+
+    rows, counts = ingest_new._filter_kb_rows([_row("Решение: проверить логи")], search_fn=lambda q, top_k=1: [])
+    assert rows == []
+    assert counts["skipped_judge_reject"] == 1
