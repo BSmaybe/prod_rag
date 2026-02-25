@@ -34,6 +34,7 @@ logger = logging.getLogger("rag.vectordb")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = os.getenv("COLLECTION_NAME") or os.getenv("QDRANT_COLLECTION", "kb_tickets")
+ARTICLES_COLLECTION = os.getenv("ARTICLES_COLLECTION", "kb_articles")
 
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "/app/model_data")
 EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
@@ -83,14 +84,20 @@ def _ticket_u64_id(issue_key: str) -> int:
     return int.from_bytes(h[:8], "big", signed=False)
 
 
-def _ensure_collection(vector_dim: int) -> None:
+def _article_u64_id(doc_id: str, chunk_idx: int) -> int:
+    key = f"{doc_id}#{chunk_idx}"
+    h = hashlib.sha1(key.encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big", signed=False)
+
+
+def _ensure_collection_for(collection_name: str, vector_dim: int) -> None:
     """
     ВАЖНО: НЕ пересоздаем коллекцию (recreate/delete), только создаем если её нет.
     """
     client = _get_qdrant()
 
     try:
-        col = client.get_collection(QDRANT_COLLECTION)
+        col = client.get_collection(collection_name)
         # проверим, что размерность совпадает (минимальная защита от 400)
         try:
             if QDRANT_VECTOR_NAME:
@@ -100,7 +107,7 @@ def _ensure_collection(vector_dim: int) -> None:
                     existing_dim = int(cfg[QDRANT_VECTOR_NAME].size)
                     if existing_dim != vector_dim:
                         raise RuntimeError(
-                            f"Qdrant collection '{QDRANT_COLLECTION}' vector size mismatch: "
+                            f"Qdrant collection '{collection_name}' vector size mismatch: "
                             f"{existing_dim} != {vector_dim} (vector name='{QDRANT_VECTOR_NAME}')"
                         )
             else:
@@ -110,7 +117,7 @@ def _ensure_collection(vector_dim: int) -> None:
                     existing_dim = int(cfg.size)
                     if existing_dim != vector_dim:
                         raise RuntimeError(
-                            f"Qdrant collection '{QDRANT_COLLECTION}' vector size mismatch: "
+                            f"Qdrant collection '{collection_name}' vector size mismatch: "
                             f"{existing_dim} != {vector_dim}"
                         )
         except Exception:
@@ -123,7 +130,7 @@ def _ensure_collection(vector_dim: int) -> None:
         pass
 
     # create missing collection
-    logger.warning("Qdrant collection '%s' is missing. Creating...", QDRANT_COLLECTION)
+    logger.warning("Qdrant collection '%s' is missing. Creating...", collection_name)
 
     if QDRANT_VECTOR_NAME:
         vectors_config = {QDRANT_VECTOR_NAME: qm.VectorParams(size=vector_dim, distance=qm.Distance.COSINE)}
@@ -131,9 +138,13 @@ def _ensure_collection(vector_dim: int) -> None:
         vectors_config = qm.VectorParams(size=vector_dim, distance=qm.Distance.COSINE)
 
     client.create_collection(
-        collection_name=QDRANT_COLLECTION,
+        collection_name=collection_name,
         vectors_config=vectors_config,
     )
+
+
+def _ensure_collection(vector_dim: int) -> None:
+    _ensure_collection_for(QDRANT_COLLECTION, vector_dim)
 
 
 def _encode_passages(texts: List[str], *, show_progress: bool = False) -> np.ndarray:
@@ -196,6 +207,25 @@ def _vector_payload(points: List[qm.ScoredPoint]) -> List[Dict[str, Any]]:
                 "service": str(service),
                 "snippet": str(payload.get("snippet") or ""),
                 "text_hash": payload.get("text_hash"),
+                "source_type": payload.get("source_type") or "kb",
+            }
+        )
+    return out
+
+
+def _vector_payload_articles(points: List[qm.ScoredPoint]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for p in points:
+        payload = p.payload or {}
+        text = payload.get("text_chunk") or payload.get("text") or ""
+        out.append(
+            {
+                "score": float(p.score),
+                "doc_id": payload.get("doc_id"),
+                "title": payload.get("title"),
+                "text": str(text),
+                "snippet": str(payload.get("snippet") or ""),
+                "source_type": "article",
             }
         )
     return out
@@ -250,6 +280,7 @@ def upsert_tickets(rows: List[Dict[str, str]]) -> int:
                 "service": service,
                 "snippet": idx_text[:300],
                 "text_hash": text_hash,
+                "source_type": "kb",
             }
         )
 
@@ -302,6 +333,100 @@ def upsert_tickets(rows: List[Dict[str, str]]) -> int:
             # покажем контекст для 400
             first_key = batch_payload[0].get("issue_key") if batch_payload else None
             logger.exception("upsert FAILED at batch=%s first_issue_key=%s", i // UPSERT_BATCH_SIZE, first_key)
+            raise
+
+    return total
+
+
+def upsert_articles(rows: List[Dict[str, str]]) -> int:
+    """
+    rows: [{"doc_id": "...", "title": "...", "text": "...", "chunk_index": 0, "source_path": "..."}]
+    """
+    if not rows:
+        return 0
+
+    indexed_texts: List[str] = []
+    ids: List[int] = []
+    payloads: List[Dict[str, Any]] = []
+
+    for r in rows:
+        doc_id = (r.get("doc_id") or "").strip()
+        text = (r.get("text") or "").strip()
+        if not doc_id or not text:
+            continue
+
+        title = (r.get("title") or "").strip()
+        chunk_index = int(r.get("chunk_index") or 0)
+        source_path = (r.get("source_path") or "").strip()
+
+        idx_text = "\n".join([p for p in [f"[TITLE] {title}" if title else "", text] if p]).strip()
+        if not idx_text:
+            continue
+
+        text_hash = hashlib.sha1(idx_text.encode("utf-8")).hexdigest()
+        indexed_texts.append(idx_text)
+        ids.append(_article_u64_id(doc_id, chunk_index))
+
+        payloads.append(
+            {
+                "doc_id": doc_id,
+                "title": title,
+                "text_chunk": idx_text,
+                "text": idx_text,
+                "snippet": idx_text[:300],
+                "chunk_index": chunk_index,
+                "source_path": source_path,
+                "text_hash": text_hash,
+                "source_type": "article",
+            }
+        )
+
+    if not indexed_texts:
+        return 0
+
+    vectors = _encode_passages(indexed_texts, show_progress=True)
+    dim = int(vectors.shape[1])
+
+    _ensure_collection_for(ARTICLES_COLLECTION, dim)
+
+    client = _get_qdrant()
+    total = 0
+
+    for i in range(0, len(payloads), UPSERT_BATCH_SIZE):
+        batch_ids = ids[i : i + UPSERT_BATCH_SIZE]
+        batch_vec = vectors[i : i + UPSERT_BATCH_SIZE]
+        batch_payload = payloads[i : i + UPSERT_BATCH_SIZE]
+
+        if QDRANT_VECTOR_NAME:
+            points = [
+                qm.PointStruct(
+                    id=batch_ids[j],
+                    vector={QDRANT_VECTOR_NAME: batch_vec[j].tolist()},
+                    payload=batch_payload[j],
+                )
+                for j in range(len(batch_ids))
+            ]
+        else:
+            points = [
+                qm.PointStruct(
+                    id=batch_ids[j],
+                    vector=batch_vec[j].tolist(),
+                    payload=batch_payload[j],
+                )
+                for j in range(len(batch_ids))
+            ]
+
+        try:
+            client.upsert(
+                collection_name=ARTICLES_COLLECTION,
+                points=points,
+                wait=QDRANT_WAIT,
+            )
+            total += len(points)
+            logger.info("upsert articles OK: %s/%s", total, len(payloads))
+        except Exception:
+            first_id = batch_payload[0].get("doc_id") if batch_payload else None
+            logger.exception("upsert articles FAILED at batch=%s first_doc_id=%s", i // UPSERT_BATCH_SIZE, first_id)
             raise
 
     return total
@@ -370,6 +495,60 @@ def search_hits(query: str, top_k: int = DEFAULT_TOP_K) -> List[Dict[str, Any]]:
     except Exception:
         logger.exception("search_hits failed")
         raise
+
+
+def search_articles(query: str, top_k: int = DEFAULT_TOP_K) -> List[Dict[str, Any]]:
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    vec = _encode_query(query)
+    if not vec:
+        return []
+
+    client = _get_qdrant()
+
+    try:
+        if hasattr(client, "query_points"):
+            if QDRANT_VECTOR_NAME:
+                qr = client.query_points(
+                    collection_name=ARTICLES_COLLECTION,
+                    query=qm.NamedVector(name=QDRANT_VECTOR_NAME, vector=vec),
+                    limit=top_k,
+                    with_payload=True,
+                )
+            else:
+                qr = client.query_points(
+                    collection_name=ARTICLES_COLLECTION,
+                    query=vec,
+                    limit=top_k,
+                    with_payload=True,
+                )
+            points = getattr(qr, "points", qr)
+            return _vector_payload_articles(points)
+
+        if hasattr(client, "search_points"):
+            if QDRANT_VECTOR_NAME:
+                sr = client.search_points(
+                    collection_name=ARTICLES_COLLECTION,
+                    vector=qm.NamedVector(name=QDRANT_VECTOR_NAME, vector=vec),
+                    limit=top_k,
+                    with_payload=True,
+                )
+            else:
+                sr = client.search_points(
+                    collection_name=ARTICLES_COLLECTION,
+                    vector=vec,
+                    limit=top_k,
+                    with_payload=True,
+                )
+            points = getattr(sr, "result", sr)
+            return _vector_payload_articles(points)
+
+        return []
+    except Exception:
+        logger.exception("search_articles failed")
+        return []
 
 
 

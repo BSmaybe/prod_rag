@@ -58,6 +58,24 @@ curl http://localhost:8080/readyz
 Если `solution_text` передан, в Qdrant индексируется объединённый текст `problem + solution`.
 В payload сохраняются раздельные поля: `problem_text`, `solution_text`, `text_chunk`.
 
+## Articles collection (product knowledge)
+Для статей используется отдельная коллекция `ARTICLES_COLLECTION` (по умолчанию `kb_articles`).
+Статьи читаются из папки `ARTICLES_DIR` (md/txt), чанкуются по абзацам.
+Опционально включается LLM‑judge для очистки/структурирования (off-line при reindex).
+Для продуктовых статей используйте `ARTICLES_JUDGE_MODE=product`.
+
+Ручной запуск:
+```
+POST /manage/reindex_articles
+```
+
+### KB фильтры для bulk reindex
+Для `/manage/reindex` включены быстрые фильтры качества (без LLM):
+- `KB_REQUIRE_SOLUTION=1` — не индексировать тикеты без решения.
+- `KB_MIN_SOLUTION_CHARS=30` — не индексировать короткие решения.
+- `KB_STOPWORDS=...` — отсекает «отписки» вроде “Ок/Решено”.
+- `KB_DEDUP_ENABLED=1` — семантический дедуп (score >= `KB_DEDUP_SCORE`).
+
 ## Qdrant reset/reload
 1. Остановить входящий callback поток из Naumen.
 2. Удалить коллекцию:
@@ -73,11 +91,17 @@ curl -X DELETE "http://localhost:6333/collections/${COLLECTION_NAME:-kb_tickets}
 ## Переменные окружения (ключевые)
 - `DB_URL`, `POSTGRES_*`
 - `QDRANT_URL`, `COLLECTION_NAME=kb_tickets`
+- `ARTICLES_COLLECTION=kb_articles`, `ARTICLES_DIR=data/articles`
+- `ARTICLES_MAX_CHUNK_CHARS=900`, `ARTICLES_TOP_K=2`, `ARTICLES_ANONYMIZE=0`
+- `ARTICLES_JUDGE_ENABLED=0`, `ARTICLES_JUDGE_CACHE_DIR=data/articles_clean`
+- `ARTICLES_JUDGE_MODE=product`
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `ASK_DEFAULT_TOP_K=3`, `ASK_MAX_TOP_K=10`, `PROCESS_TOP_K=3`
 - `LLM_MAX_CHUNK_CHARS=900`, `LLM_MAX_CONTEXT_CHARS=2800`, `LLM_MIN_TAIL_CHARS=220`
 - `RERANK_ENABLED=true`, `RERANK_POOL_MULTIPLIER=3`
 - `RERANK_WEIGHT_VECTOR=0.65`, `RERANK_WEIGHT_LEXICAL=0.35`, `RERANK_OVERLAP_BOOST=0.20`
+- `KB_MIN_SOLUTION_CHARS=30`, `KB_REQUIRE_SOLUTION=1`
+- `KB_STOPWORDS=решено,...`, `KB_DEDUP_ENABLED=1`, `KB_DEDUP_SCORE=0.92`, `KB_DEDUP_TOP_K=1`
 - `N8N_WEBHOOK_URL`, `WEBHOOK_URL`
 - `NAUMEN_API_URL`
 - `SERVICE_API_KEY`/`SERVICE_DESK_API_KEY`

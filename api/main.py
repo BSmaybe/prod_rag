@@ -38,7 +38,7 @@ from api.manage import router as manage_router
 from api.routes.servicedesk import router as servicedesk_router
 from api.utils.formatter import to_structured
 from core.llm import generate_answer
-from core.vectordb import search_hits
+from core.vectordb import search_hits, search_articles
 from etl.anonymize import anonymize_text
 
 
@@ -74,6 +74,7 @@ NO_CONTEXT_SCORE_THRESHOLD = float(os.getenv("NO_CONTEXT_SCORE_THRESHOLD", "0.35
 NO_CONTEXT_MIN_HITS = int(os.getenv("NO_CONTEXT_MIN_HITS", "2"))
 ASK_MAX_TOP_K = max(1, int(os.getenv("ASK_MAX_TOP_K", "10")))
 ASK_DEFAULT_TOP_K = max(1, min(ASK_MAX_TOP_K, int(os.getenv("ASK_DEFAULT_TOP_K", "3"))))
+ARTICLES_TOP_K = max(0, int(os.getenv("ARTICLES_TOP_K", "2")))
 LLM_MAX_CHUNK_CHARS = max(1, int(os.getenv("LLM_MAX_CHUNK_CHARS", "900")))
 LLM_MAX_CONTEXT_CHARS = max(1, int(os.getenv("LLM_MAX_CONTEXT_CHARS", "2800")))
 LLM_MIN_TAIL_CHARS = max(1, int(os.getenv("LLM_MIN_TAIL_CHARS", "220")))
@@ -340,12 +341,22 @@ def _run_ticket_reasoning(
 
     try:
         top_k = int(os.getenv("PROCESS_TOP_K", "5"))
+        articles_top_k = max(0, int(ARTICLES_TOP_K))
         candidate_k = max(top_k, top_k * RERANK_POOL_MULTIPLIER)
+        candidate_articles_k = (
+            max(articles_top_k, articles_top_k * RERANK_POOL_MULTIPLIER) if articles_top_k > 0 else 0
+        )
 
         # ---- retrieval
         t_retrieval = time.perf_counter()
         hits_raw = search_hits(clean_text, top_k=candidate_k) or []
-        hits = _rerank_hits(clean_text, hits_raw, top_k)
+        hits_kb = _rerank_hits(clean_text, hits_raw, top_k)
+        hits_articles: list[Any] = []
+        if articles_top_k > 0:
+            art_raw = search_articles(clean_text, top_k=candidate_articles_k) or []
+            hits_articles = _rerank_hits(clean_text, art_raw, articles_top_k)
+        combined_k = top_k + (articles_top_k or 0)
+        hits = _merge_hits_by_score(hits_kb + hits_articles, combined_k)
         used_issue_keys, used_snippets, context_chunks, scores = _hits_to_context(hits)
         top1_score = float(scores[0]) if scores else 0.0
         context_chunks_nonempty = [c for c in context_chunks if c and c.strip()]
@@ -679,7 +690,7 @@ def _extract_text_from_payload(payload: Any) -> str:
     return str(text)
 
 
-def _hit_to_row(h: Any) -> tuple[Any, str, float]:
+def _hit_to_row(h: Any) -> tuple[Any, str, float, str]:
     """
     Приводим один hit к (key, text, score) с максимальной совместимостью.
 
@@ -692,28 +703,30 @@ def _hit_to_row(h: Any) -> tuple[Any, str, float]:
     if isinstance(h, dict):
         # --- Qdrant-like
         if ("payload" in h) or ("score" in h and ("id" in h or "point_id" in h)):
-            key = h.get("id") or h.get("point_id") or h.get("issue_key")
+            key = h.get("id") or h.get("point_id") or h.get("issue_key") or h.get("doc_id")
             score = float(h.get("score", 0.0) or 0.0)
             payload = h.get("payload") or {}
             text = _extract_text_from_payload(payload)
             if not text:
                 text = str(h.get("text") or h.get("issue_text") or h.get("content") or "")
-            return key, text, score
+            source_type = (payload.get("source_type") or h.get("source_type") or "kb")
+            return key, text, score, str(source_type)
 
         # --- кастомный dict
-        key = h.get("issue_key") or h.get("id") or h.get("key")
+        key = h.get("issue_key") or h.get("doc_id") or h.get("id") or h.get("key")
         text = str(h.get("text") or h.get("issue_text") or h.get("content") or "")
         score = float(h.get("score", 0.0) or 0.0)
-        return key, text, score
+        source_type = h.get("source_type") or "kb"
+        return key, text, score, str(source_type)
 
     # legacy tuple/list
     if isinstance(h, (tuple, list)):
         key = h[0] if len(h) > 0 else None
         text = str(h[1]) if len(h) > 1 and h[1] is not None else ""
         score = float(h[2]) if len(h) > 2 and h[2] is not None else 0.0
-        return key, text, score
+        return key, text, score, "kb"
 
-    return None, "", 0.0
+    return None, "", 0.0, "kb"
 
 
 def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], list[float]]:
@@ -727,12 +740,13 @@ def _hits_to_context(hits: list[Any]) -> tuple[list[Any], list[str], list[str], 
     scores: list[float] = []
 
     for h in hits or []:
-        key, text, score = _hit_to_row(h)
-        kb_id = key or "-"
-        used_ids.append(key)
+        key, text, score, source_type = _hit_to_row(h)
+        ref_prefix = "kb" if str(source_type) != "article" else "art"
+        ref_id = key or "-"
+        used_ids.append(f"{ref_prefix}:{ref_id}")
         scores.append(float(score))
         chunks.append(
-            f"[kb:{kb_id}] [score:{float(score):.4f}]\n{text or ''}".strip()
+            f"[{ref_prefix}:{ref_id}] [score:{float(score):.4f}]\n{text or ''}".strip()
         )
         snippets.append((text or "")[:300])
 
@@ -771,10 +785,10 @@ def _rerank_hits(query: str, hits: list[Any], top_k: int) -> list[Any]:
     if not RERANK_ENABLED or len(hits) <= top_k:
         return hits[:top_k]
 
-    parsed: list[tuple[Any, str, float, Any]] = []
+    parsed: list[tuple[Any, str, float, str, Any]] = []
     for h in hits:
-        key, text, score = _hit_to_row(h)
-        parsed.append((key, text or "", float(score), h))
+        key, text, score, source_type = _hit_to_row(h)
+        parsed.append((key, text or "", float(score), str(source_type), h))
 
     vec_scores = [p[2] for p in parsed]
     min_s = min(vec_scores)
@@ -784,7 +798,7 @@ def _rerank_hits(query: str, hits: list[Any], top_k: int) -> list[Any]:
     q_tokens = _tokenize_for_rerank(query)
 
     ranked: list[tuple[float, Any]] = []
-    for _, text, score, raw in parsed:
+    for _, text, score, _source_type, raw in parsed:
         t_tokens = _tokenize_for_rerank(text)
         overlap = len(q_tokens & t_tokens)
         union = len(q_tokens | t_tokens)
@@ -799,6 +813,14 @@ def _rerank_hits(query: str, hits: list[Any], top_k: int) -> list[Any]:
 
     ranked.sort(key=lambda x: x[0], reverse=True)
     return [item[1] for item in ranked[:top_k]]
+
+
+def _merge_hits_by_score(hits: list[Any], limit: int) -> list[Any]:
+    if not hits:
+        return []
+    if limit <= 0:
+        return []
+    return sorted(hits, key=lambda h: _hit_to_row(h)[2], reverse=True)[:limit]
 
 
 def _build_limited_context(
@@ -905,10 +927,20 @@ def ask(
     # 1) Поиск контекста в Qdrant
     try:
         top_k = max(1, min(ASK_MAX_TOP_K, int(context_count)))
+        articles_top_k = max(0, int(ARTICLES_TOP_K))
         candidate_k = max(top_k, top_k * RERANK_POOL_MULTIPLIER)
+        candidate_articles_k = (
+            max(articles_top_k, articles_top_k * RERANK_POOL_MULTIPLIER) if articles_top_k > 0 else 0
+        )
         with _stage(timings, "retrieval_ms"):
             raw_results = search_hits(issue_text, top_k=candidate_k) or []
-            results = _rerank_hits(issue_text, raw_results, top_k)
+            kb_results = _rerank_hits(issue_text, raw_results, top_k)
+            art_results: list[Any] = []
+            if articles_top_k > 0:
+                art_raw = search_articles(issue_text, top_k=candidate_articles_k) or []
+                art_results = _rerank_hits(issue_text, art_raw, articles_top_k)
+            combined_k = top_k + (articles_top_k or 0)
+            results = _merge_hits_by_score(kb_results + art_results, combined_k)
     except Exception as e:
         return JSONResponse(
             status_code=500,
