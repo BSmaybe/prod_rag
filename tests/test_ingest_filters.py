@@ -18,9 +18,10 @@ def test_filter_short_solution(monkeypatch):
     monkeypatch.setenv("KB_STOPWORDS", "")
     monkeypatch.setenv("KB_DEDUP_ENABLED", "0")
 
-    rows, counts = ingest_new._filter_kb_rows([_row("ок")], search_fn=lambda q, top_k=1: [])
+    rows, counts, skipped = ingest_new._filter_kb_rows([_row("ок")], search_fn=lambda q, top_k=1: [])
     assert rows == []
     assert counts["skipped_short_solution"] == 1
+    assert skipped
 
 
 def test_filter_stopword_solution(monkeypatch):
@@ -29,18 +30,20 @@ def test_filter_stopword_solution(monkeypatch):
     monkeypatch.setenv("KB_STOPWORDS", "решено,сделано,ок")
     monkeypatch.setenv("KB_DEDUP_ENABLED", "0")
 
-    rows, counts = ingest_new._filter_kb_rows([_row("Ок")], search_fn=lambda q, top_k=1: [])
+    rows, counts, skipped = ingest_new._filter_kb_rows([_row("Ок")], search_fn=lambda q, top_k=1: [])
     assert rows == []
     assert counts["skipped_stopword"] == 1
+    assert skipped
 
 
 def test_filter_missing_solution(monkeypatch):
     monkeypatch.setenv("KB_REQUIRE_SOLUTION", "1")
     monkeypatch.setenv("KB_DEDUP_ENABLED", "0")
 
-    rows, counts = ingest_new._filter_kb_rows([_row("")], search_fn=lambda q, top_k=1: [])
+    rows, counts, skipped = ingest_new._filter_kb_rows([_row("")], search_fn=lambda q, top_k=1: [])
     assert rows == []
     assert counts["skipped_no_solution"] == 1
+    assert skipped
 
 
 def test_filter_dedup(monkeypatch):
@@ -54,9 +57,10 @@ def test_filter_dedup(monkeypatch):
     def _hits(_q: str, _k: int = 1):
         return [{"score": 0.95}]
 
-    rows, counts = ingest_new._filter_kb_rows([_row("Решение: проверить логи и перезапустить")], search_fn=_hits)
+    rows, counts, skipped = ingest_new._filter_kb_rows([_row("Решение: проверить логи и перезапустить")], search_fn=_hits)
     assert rows == []
     assert counts["skipped_dedup"] == 1
+    assert skipped
 
 
 def test_kb_judge_accept(monkeypatch):
@@ -77,11 +81,12 @@ def test_kb_judge_accept(monkeypatch):
     monkeypatch.setenv("KB_REQUIRE_SOLUTION", "1")
     monkeypatch.setenv("KB_MIN_SOLUTION_CHARS", "1")
 
-    rows, counts = ingest_new._filter_kb_rows([_row("Решение: проверить логи")], search_fn=lambda q, top_k=1: [])
+    rows, counts, skipped = ingest_new._filter_kb_rows([_row("Решение: проверить логи")], search_fn=lambda q, top_k=1: [])
     assert rows
     assert rows[0]["text"]
     assert rows[0]["solution_text"]
     assert counts["skipped_judge_reject"] == 0
+    assert skipped == []
 
 
 def test_kb_judge_reject(monkeypatch):
@@ -102,6 +107,7 @@ def test_kb_judge_reject(monkeypatch):
     monkeypatch.setenv("KB_REQUIRE_SOLUTION", "1")
     monkeypatch.setenv("KB_MIN_SOLUTION_CHARS", "1")
 
-    rows, counts = ingest_new._filter_kb_rows([_row("Решение: проверить логи")], search_fn=lambda q, top_k=1: [])
+    rows, counts, skipped = ingest_new._filter_kb_rows([_row("Решение: проверить логи")], search_fn=lambda q, top_k=1: [])
     assert rows == []
     assert counts["skipped_judge_reject"] == 1
+    assert skipped

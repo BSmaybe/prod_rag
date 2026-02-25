@@ -111,6 +111,9 @@ KB_JUDGE_CONNECT_TIMEOUT_SEC = float(os.getenv("KB_JUDGE_CONNECT_TIMEOUT_SEC", "
 KB_JUDGE_NUM_CTX = _get_env_int("KB_JUDGE_NUM_CTX", 2048)
 KB_JUDGE_NUM_PREDICT = _get_env_int("KB_JUDGE_NUM_PREDICT", 320)
 KB_JUDGE_MODE = _get_env_str("KB_JUDGE_MODE", "incident").strip().lower()
+KB_LOG_SKIPPED = _get_env_bool("KB_LOG_SKIPPED", True)
+KB_LOG_ADDED = _get_env_bool("KB_LOG_ADDED", True)
+KB_LOG_DIR = _get_env_str("KB_LOG_DIR", "data")
 
 
 def _sha1_text(text: str) -> str:
@@ -235,7 +238,7 @@ def _filter_kb_rows(
     rows: List[Dict[str, str]],
     *,
     search_fn: Callable[[str, int], List[Dict[str, Any]]] = search_hits,
-) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+) -> Tuple[List[Dict[str, str]], Dict[str, int], List[Tuple[str, str]]]:
     """
     Возвращает (отфильтрованные строки, счётчики).
     Фильтры применяются ТОЛЬКО для bulk reindex.
@@ -261,21 +264,25 @@ def _filter_kb_rows(
     dedup_top_k = _get_env_int("KB_DEDUP_TOP_K", 1)
 
     kept: List[Dict[str, str]] = []
+    skipped: List[Tuple[str, str]] = []
 
     for r in rows:
         solution = _norm(r.get("solution_text"))
 
         if require_solution and not solution:
             counts["skipped_no_solution"] += 1
+            skipped.append((r.get("issue_key") or "", "no_solution"))
             continue
 
         if solution and len(solution) < min_solution_len:
             counts["skipped_short_solution"] += 1
+            skipped.append((r.get("issue_key") or "", "short_solution"))
             continue
 
         if solution and stopwords:
             if _normalize_for_stopwords(solution) in stopwords:
                 counts["skipped_stopword"] += 1
+                skipped.append((r.get("issue_key") or "", "stopword"))
                 continue
 
         # ---- optional LLM judge (offline)
@@ -293,11 +300,13 @@ def _filter_kb_rows(
                     sym, sol = _parse_judge_output(cached)
                     if not sym or not sol:
                         counts["skipped_judge_reject"] += 1
+                        skipped.append((r.get("issue_key") or "", "judge_reject"))
                         continue
                     r["text"] = sym
                     r["solution_text"] = sol
                 elif reject_path.exists():
                     counts["skipped_judge_reject"] += 1
+                    skipped.append((r.get("issue_key") or "", "judge_reject"))
                     continue
                 else:
                     try:
@@ -308,6 +317,7 @@ def _filter_kb_rows(
                     if not judged:
                         _save_reject(reject_path)
                         counts["skipped_judge_reject"] += 1
+                        skipped.append((r.get("issue_key") or "", "judge_reject"))
                         continue
                     sym, sol = judged
                     r["text"] = sym
@@ -334,12 +344,13 @@ def _filter_kb_rows(
                         top_score = float(hits[0].get("score") or 0.0)
                         if top_score >= dedup_score:
                             counts["skipped_dedup"] += 1
+                            skipped.append((r.get("issue_key") or "", "dedup"))
                             continue
 
         kept.append(r)
 
     counts["kept"] = len(kept)
-    return kept, counts
+    return kept, counts, skipped
 
 
 def _load_csv_rows() -> List[Dict[str, str]]:
@@ -387,7 +398,7 @@ def ingest_new_tickets() -> int | dict[str, int]:
     if not rows:
         return 0
 
-    rows, counts = _filter_kb_rows(rows)
+    rows, counts, skipped = _filter_kb_rows(rows)
     log.info(
         "kb_filter_summary total=%s kept=%s skipped_no_solution=%s skipped_short_solution=%s "
         "skipped_stopword=%s skipped_dedup=%s skipped_judge_reject=%s judge_cached=%s judge_ran=%s",
@@ -405,9 +416,29 @@ def ingest_new_tickets() -> int | dict[str, int]:
     if not rows:
         return 0
 
+    # write skipped/added logs
+    log_dir = Path(KB_LOG_DIR)
+    if KB_LOG_SKIPPED and skipped:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        skipped_path = log_dir / "ingest_skipped.csv"
+        with skipped_path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["issue_key", "reason"])
+            for key, reason in skipped:
+                w.writerow([key, reason])
+
     backend = (os.getenv("INGEST_BACKEND") or os.getenv("VECTOR_BACKEND") or "qdrant").lower()
 
     if backend in {"qdrant", "qd"}:
-        return upsert_tickets(rows)
+        added = upsert_tickets(rows)
+        if KB_LOG_ADDED and added:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            added_path = log_dir / "ingest_added.csv"
+            with added_path.open("w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["issue_key"])
+                for r in rows:
+                    w.writerow([r.get("issue_key") or ""])
+        return added
 
     raise RuntimeError("Unsupported INGEST_BACKEND. Use: qdrant.")

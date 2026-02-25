@@ -77,6 +77,8 @@ POST /manage/reindex_articles
 - `KB_DEDUP_ENABLED=1` — семантический дедуп (score >= `KB_DEDUP_SCORE`).
 Опционально включается LLM‑judge для тикетов (off-line при reindex):
 - `KB_JUDGE_ENABLED=1`, `KB_JUDGE_MODE=incident`
+Для аудита можно писать списки загруженных/пропущенных:
+- `KB_LOG_SKIPPED=1`, `KB_LOG_ADDED=1`, `KB_LOG_DIR=data`
 
 ## Qdrant reset/reload
 1. Остановить входящий callback поток из Naumen.
