@@ -105,6 +105,7 @@ def _get_env_str(name: str, default: str) -> str:
 KB_JUDGE_ENABLED = _get_env_bool("KB_JUDGE_ENABLED", False)
 KB_JUDGE_MODEL = _get_env_str("KB_JUDGE_MODEL", OLLAMA_MODEL)
 KB_JUDGE_CACHE_DIR = _get_env_str("KB_JUDGE_CACHE_DIR", "data/tickets_clean")
+KB_JUDGE_CACHE_ENABLED = _get_env_bool("KB_JUDGE_CACHE_ENABLED", False)
 KB_JUDGE_MAX_CHARS = _get_env_int("KB_JUDGE_MAX_CHARS", 6000)
 KB_JUDGE_TIMEOUT_SEC = float(os.getenv("KB_JUDGE_TIMEOUT_SEC", "60"))
 KB_JUDGE_CONNECT_TIMEOUT_SEC = float(os.getenv("KB_JUDGE_CONNECT_TIMEOUT_SEC", "10"))
@@ -292,22 +293,38 @@ def _filter_kb_rows(
             if raw_problem and raw_solution:
                 # anonymize before sending to LLM
                 judge_input = anonymize_text(f"{raw_problem}\n\nРешение:\n{raw_solution}")
-                digest = _sha1_text(judge_input)
-                clean_path, reject_path = _cache_paths(digest)
-                cached = _load_cached(clean_path, reject_path)
-                if cached is not None:
-                    counts["judge_cached"] += 1
-                    sym, sol = _parse_judge_output(cached)
-                    if not sym or not sol:
+                if KB_JUDGE_CACHE_ENABLED:
+                    digest = _sha1_text(judge_input)
+                    clean_path, reject_path = _cache_paths(digest)
+                    cached = _load_cached(clean_path, reject_path)
+                    if cached is not None:
+                        counts["judge_cached"] += 1
+                        sym, sol = _parse_judge_output(cached)
+                        if not sym or not sol:
+                            counts["skipped_judge_reject"] += 1
+                            skipped.append((r.get("issue_key") or "", "judge_reject"))
+                            continue
+                        r["text"] = sym
+                        r["solution_text"] = sol
+                    elif reject_path.exists():
                         counts["skipped_judge_reject"] += 1
                         skipped.append((r.get("issue_key") or "", "judge_reject"))
                         continue
-                    r["text"] = sym
-                    r["solution_text"] = sol
-                elif reject_path.exists():
-                    counts["skipped_judge_reject"] += 1
-                    skipped.append((r.get("issue_key") or "", "judge_reject"))
-                    continue
+                    else:
+                        try:
+                            counts["judge_ran"] += 1
+                            judged = _judge_ticket(judge_input)
+                        except Exception:
+                            judged = None
+                        if not judged:
+                            _save_reject(reject_path)
+                            counts["skipped_judge_reject"] += 1
+                            skipped.append((r.get("issue_key") or "", "judge_reject"))
+                            continue
+                        sym, sol = judged
+                        r["text"] = sym
+                        r["solution_text"] = sol
+                        _save_clean(clean_path, f"СИМПТОМЫ: {sym}\nРЕШЕНИЕ: {sol}")
                 else:
                     try:
                         counts["judge_ran"] += 1
@@ -315,14 +332,12 @@ def _filter_kb_rows(
                     except Exception:
                         judged = None
                     if not judged:
-                        _save_reject(reject_path)
                         counts["skipped_judge_reject"] += 1
                         skipped.append((r.get("issue_key") or "", "judge_reject"))
                         continue
                     sym, sol = judged
                     r["text"] = sym
                     r["solution_text"] = sol
-                    _save_clean(clean_path, f"СИМПТОМЫ: {sym}\nРЕШЕНИЕ: {sol}")
 
         # refresh solution after possible judge rewrite
         solution = _norm(r.get("solution_text"))
@@ -416,16 +431,16 @@ def ingest_new_tickets() -> int | dict[str, int]:
     if not rows:
         return 0
 
-    # write skipped/added logs
+    # write skipped/added logs (only ticket numbers)
     log_dir = Path(KB_LOG_DIR)
     if KB_LOG_SKIPPED and skipped:
         log_dir.mkdir(parents=True, exist_ok=True)
-        skipped_path = log_dir / "ingest_skipped.csv"
+        skipped_path = log_dir / "ingest_rejected.csv"
         with skipped_path.open("w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["issue_key", "reason"])
-            for key, reason in skipped:
-                w.writerow([key, reason])
+            w.writerow(["issue_key"])
+            for key, _reason in skipped:
+                w.writerow([key])
 
     backend = (os.getenv("INGEST_BACKEND") or os.getenv("VECTOR_BACKEND") or "qdrant").lower()
 

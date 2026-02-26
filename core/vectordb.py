@@ -39,6 +39,13 @@ ARTICLES_COLLECTION = os.getenv("ARTICLES_COLLECTION", "kb_articles")
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "/app/model_data")
 EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 
+
+def _is_missing_collection_error(err: Exception) -> bool:
+    msg = str(err)
+    # qdrant client usually returns:
+    # "Unexpected Response: 404 (Not Found)" + "Collection '...' doesn't exist"
+    return "Collection" in msg and ("doesn't exist" in msg or "Not found" in msg or "404" in msg)
+
 # performance knobs
 ENCODE_BATCH_SIZE = int(os.getenv("ENCODE_BATCH_SIZE", "64"))  # CPU: 32-64 ok
 UPSERT_BATCH_SIZE = int(os.getenv("UPSERT_BATCH_SIZE", "200"))
@@ -492,7 +499,10 @@ def search_hits(query: str, top_k: int = DEFAULT_TOP_K) -> List[Dict[str, Any]]:
             "Please upgrade qdrant-client or use REST fallback."
         )
 
-    except Exception:
+    except Exception as e:
+        if _is_missing_collection_error(e):
+            logger.warning("search_hits: collection missing, returning empty")
+            return []
         logger.exception("search_hits failed")
         raise
 
