@@ -1,31 +1,33 @@
 FROM local-python:3.11-slim
 
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-
-ENV http_proxy=${http_proxy}
-ENV https_proxy=${https_proxy}
-ENV no_proxy=${no_proxy}
-
 WORKDIR /app
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_ROOT_USER_ACTION=ignore
+    PIP_ROOT_USER_ACTION=ignore \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
-# 1) Ставим Python-зависимости
+ARG NEXUS_PYPI_URL="https://nexus.apps.devops.bcc.kz/repository/pypi-proxy/simple"
+ARG NEXUS_HOST="nexus.apps.devops.bcc.kz"
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 COPY api/requirements.txt ./requirements.txt
-RUN pip install --prefer-binary -r requirements.txt
 
-# 2) Копируем код по папкам
+RUN python -m pip install --no-cache-dir --prefer-binary \
+      --index-url "${NEXUS_PYPI_URL}" \
+      --trusted-host "${NEXUS_HOST}" \
+      -r requirements.txt
+
 COPY api /app/api
 COPY retriever /app/retriever
 COPY utils /app/utils
 COPY core /app/core
 COPY etl /app/etl
-
-ENV PYTHONPATH=/app \
-    PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]
